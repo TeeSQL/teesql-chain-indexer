@@ -1,0 +1,129 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/teesql-abi",
+    "crates/teesql-views",
+    "crates/attest",
+    "crates/server",
+    "crates/bin/teesql-chain-indexer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["TeeSQL contributors"]
+repository = "https://github.com/teesql/teesql-chain-indexer"
+
+[workspace.dependencies]
+# Local crates
+teesql-chain-indexer-core = { path = "crates/core" }
+teesql-chain-indexer-abi = { path = "crates/teesql-abi" }
+teesql-chain-indexer-views = { path = "crates/teesql-views" }
+teesql-chain-indexer-attest = { path = "crates/attest" }
+teesql-chain-indexer-server = { path = "crates/server" }
+
+# TeeSQL open-source path deps. Resolve via sibling checkouts under
+# `open-source/` — this crate is intended to live alongside its
+# dependencies in a parent layout (the dstackgres monorepo's
+# `open-source/` tree), or cloned manually beside them. See README.md
+# §Building for clone instructions. ra-tls-parse pin matches what
+# sqlx-ra-tls itself depends on so cargo resolves a single copy.
+#
+# This convention exists because sqlx-ra-tls itself path-depends on
+# ra-tls-parse, and neither is on crates.io yet. Once both publish,
+# this can switch to `version = "..."` pins and the standalone repo
+# becomes self-contained.
+sqlx-ra-tls = { path = "../sqlx-ra-tls" }
+ra-tls-parse = { version = "0.1", path = "../ra-tls-parse" }
+
+# dstack-sdk is the published crates.io version, not a path dep — the
+# parent monorepo's submodule at open-source/dstack/sdk/rust/ is the
+# same crate, but tracking the published version keeps us off the
+# submodule's bleeding edge.
+dstack-sdk = "0.1"
+
+# Async runtime + futures plumbing
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+bytes = "1"
+
+# HTTP server stack — axum 0.7 line matches the parent monorepo's
+# pin. axum-extra brings the typed-header + SSE helpers used by the
+# server crate.
+axum = "0.7"
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "auth", "set-header", "limit"] }
+
+# gRPC mirror
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
+
+# EVM client. Feature set extends the parent monorepo's pin with
+# the websocket + pubsub bits the WS subscription path needs, plus
+# rpc-types-eth for typed log/header decoding.
+alloy = { version = "1", features = [
+    "providers",
+    "provider-http",
+    "provider-ws",
+    "pubsub",
+    "transport-ws",
+    "rpc-types",
+    "rpc-types-eth",
+    "signers",
+    "signer-local",
+    "contract",
+    "sol-types",
+    "json",
+    "network",
+    "consensus",
+    "dyn-abi",
+    "json-abi",
+] }
+
+# Postgres. default-features = false + the explicit runtime-tokio +
+# tls-rustls features match what sqlx-ra-tls uses, so cargo resolves a
+# single sqlx with a single TLS stack. The default sqlx feature set
+# would pull native-tls and a different runtime that collides with the
+# rustls path sqlx-ra-tls is built on. bigdecimal is added for any
+# numeric event fields the materializer might need.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "chrono",
+    "json",
+    "bigdecimal",
+] }
+
+# Local DCAP verification — same crate sqlx-ra-tls / teesql-sidecar
+# already use. Kept on the 0.4 line for API parity.
+dcap-qvl = { version = "0.4", default-features = false, features = ["std", "report", "ring", "default-x509"] }
+
+# Serde + canonicalization helpers
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+
+# Error handling, logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI / config
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+
+# Crypto / encoding
+hex = "0.4"
+sha3 = "0.10"
+k256 = { version = "0.13", features = ["ecdsa"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }

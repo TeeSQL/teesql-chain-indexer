@@ -1,0 +1,280 @@
+// teesql-chain-indexer v1 IDL.
+//
+// Mirrors the REST surface defined in docs/specs/chain-indexer.md
+// §7.1. Every JSON endpoint has a 1:1 gRPC method here. Signed
+// responses carry the §7.1 envelope (`data`, `as_of`, `attestation`)
+// over the wire as `google.protobuf.Struct` so the proto schema does
+// not need to track every field of every materialized view —
+// downstream Rust consumers can decode the structs into typed views
+// when they want.
+//
+// REST + SSE remain the canonical transport for browser + Cloudflare
+// Worker clients. gRPC is for high-volume Rust consumers that want
+// streaming bidirectional channels.
+
+syntax = "proto3";
+package teesql.chain_indexer.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+service ChainIndexer {
+  // Liveness. Unsigned. Returns 200 + {status: "ok"} on a healthy
+  // ingest pipeline + Postgres pool.
+  rpc GetHealth(google.protobuf.Empty) returns (HealthResponse);
+
+  // TDX quote + signing pubkey. The quote is the signature; no
+  // envelope wrapping. See spec §4.
+  rpc GetAttestation(google.protobuf.Empty) returns (AttestationResponse);
+
+  // Every chain this indexer process serves, with per-chain head +
+  // finalized cursors.
+  rpc ListChains(google.protobuf.Empty) returns (ChainsResponse);
+
+  // One chain's head + finalized + last-ingested-event id. Signed.
+  rpc GetChain(GetChainRequest) returns (SignedResponse);
+
+  // Every cluster diamond minted by this factory. Signed.
+  rpc ListFactoryClusters(FactoryRequest) returns (SignedResponse);
+
+  // {contains: bool} — used by the gas-webhook on every UserOp.
+  // Tiny payload; the gas-webhook hot path. Signed.
+  rpc FactoryContains(FactoryContainsRequest) returns (SignedResponse);
+
+  // Cluster overview: leader, member count, lifecycle. Signed.
+  rpc GetCluster(ClusterRequest) returns (SignedResponse);
+
+  // (member_id, epoch). Signed.
+  rpc GetClusterLeader(ClusterRequest) returns (SignedResponse);
+
+  // Underlying events from which the leader answer was derived. The
+  // /proof companion path defined in spec §4.1. Signed.
+  rpc GetClusterLeaderProof(ClusterRequest) returns (SignedResponse);
+
+  // Full member set; honors `include_retired`. Signed.
+  rpc GetClusterMembers(MembersRequest) returns (SignedResponse);
+
+  // Underlying member-set events. Signed.
+  rpc GetClusterMembersProof(ClusterRequest) returns (SignedResponse);
+
+  // Single member detail. Signed.
+  rpc GetClusterMember(MemberRequest) returns (SignedResponse);
+
+  // Lifecycle: destroyed timestamp (or null). Signed.
+  rpc GetClusterLifecycle(ClusterRequest) returns (SignedResponse);
+
+  // Underlying lifecycle events. Signed.
+  rpc GetClusterLifecycleProof(ClusterRequest) returns (SignedResponse);
+
+  // Paginated raw event stream for the cluster, ordered by id. Skips
+  // removed=true rows. Signed.
+  rpc ListClusterEvents(ListEventsRequest) returns (SignedResponse);
+
+  // SSE-equivalent: streams every event ingested for the cluster
+  // matching the filter, starting at `since` (inclusive of the next
+  // id after `since`). Each emitted EventEnvelope is signed
+  // independently — clients may sample-verify any subset.
+  rpc StreamClusterEvents(StreamEventsRequest) returns (stream EventEnvelope);
+
+  // Single event detail in the standard signed envelope. The
+  // verification companion to bare `StreamClusterEvents` /
+  // `/events/sse` frames (spec §7.3): consumers receive bare frames
+  // for sub-millisecond fan-out, then resolve any specific event id
+  // here when they need cryptographic proof. Returns NOT_FOUND when
+  // no row matches `id`. Signed.
+  rpc GetEventById(GetEventByIdRequest) returns (SignedResponse);
+}
+
+// ---- Common: signed envelope ----
+//
+// `data` and `as_of` are google.protobuf.Struct (free-form JSON
+// equivalents) so the proto IDL does not freeze the materialized-
+// view shapes. Consumers that want a typed view decode the Struct
+// into their own target type, identical to the JSON path.
+
+message SignedResponse {
+  google.protobuf.Struct data = 1;
+  google.protobuf.Struct as_of = 2;
+  Attestation attestation = 3;
+
+  // Populated only when the request set `attest=full` with a nonce.
+  // Empty for the default path.
+  optional string quote_b64 = 4;
+}
+
+message Attestation {
+  // 0x-prefixed lowercase hex.
+  string signer_address = 1;
+  // 0x-prefixed lowercase hex; 65-byte recoverable ECDSA sig.
+  string signature = 2;
+  // 0x-prefixed lowercase hex; keccak256(canonical_json(data) ||
+  // canonical_json(as_of)).
+  string payload_hash = 3;
+  // Unix seconds.
+  uint64 signed_at = 4;
+  uint64 expires_at = 5;
+}
+
+// ---- Health / Attestation ----
+
+message HealthResponse {
+  string status = 1;             // "ok"
+  uint64 uptime_seconds = 2;
+  string version = 3;            // CARGO_PKG_VERSION
+}
+
+message AttestationResponse {
+  // 0x-prefixed lowercase hex.
+  string signer_address = 1;
+  // base64-encoded TDX quote whose report_data commits to the
+  // signing pubkey. Cached at boot for the process lifetime; see
+  // spec §4.2 for the per-request fresh-quote path.
+  string quote_b64 = 2;
+}
+
+// ---- Chains ----
+
+message GetChainRequest {
+  // Chain shortname (e.g. "base"). Mirrors the :chain path segment.
+  string chain = 1;
+
+  // Common query-param surface — same on every signed request.
+  Safety safety = 10;
+  optional uint64 as_of_block = 11;
+  optional FreshQuote fresh_quote = 12;
+}
+
+message ChainsResponse {
+  repeated ChainSummary chains = 1;
+}
+
+message ChainSummary {
+  string shortname = 1;
+  uint32 chain_id = 2;
+  uint64 head_block = 3;
+  uint64 finalized_block = 4;
+  uint64 last_event_id = 5;
+}
+
+// ---- Factory ----
+
+message FactoryRequest {
+  string chain = 1;
+  // 0x-prefixed lowercase hex (20 bytes).
+  string factory_address = 2;
+
+  Safety safety = 10;
+  optional uint64 as_of_block = 11;
+  optional FreshQuote fresh_quote = 12;
+}
+
+message FactoryContainsRequest {
+  string chain = 1;
+  string factory_address = 2;
+  // Address to test for membership in the factory's deployed set.
+  string address = 3;
+
+  Safety safety = 10;
+  optional uint64 as_of_block = 11;
+  optional FreshQuote fresh_quote = 12;
+}
+
+// ---- Cluster ----
+
+message ClusterRequest {
+  string chain = 1;
+  // 0x-prefixed lowercase hex (20 bytes).
+  string cluster_address = 2;
+
+  Safety safety = 10;
+  optional uint64 as_of_block = 11;
+  optional FreshQuote fresh_quote = 12;
+}
+
+message MembersRequest {
+  string chain = 1;
+  string cluster_address = 2;
+  // false (default) hides retired members; matches the REST default.
+  bool include_retired = 3;
+
+  Safety safety = 10;
+  optional uint64 as_of_block = 11;
+  optional FreshQuote fresh_quote = 12;
+}
+
+message MemberRequest {
+  string chain = 1;
+  string cluster_address = 2;
+  // 0x-prefixed lowercase hex (32 bytes).
+  string member_id = 3;
+
+  Safety safety = 10;
+  optional uint64 as_of_block = 11;
+  optional FreshQuote fresh_quote = 12;
+}
+
+// ---- Events ----
+
+message ListEventsRequest {
+  string chain = 1;
+  string cluster_address = 2;
+  // Resume cursor — return only events with id > since.
+  optional uint64 since = 3;
+  // Comma-split kinds, e.g. ["LeaderClaimed","MemberRegistered"].
+  // Empty → all kinds.
+  repeated string kind = 4;
+  // 1..1000; 100 default.
+  optional uint32 limit = 5;
+
+  Safety safety = 10;
+  optional uint64 as_of_block = 11;
+  optional FreshQuote fresh_quote = 12;
+}
+
+message StreamEventsRequest {
+  string chain = 1;
+  string cluster_address = 2;
+  optional uint64 since = 3;
+  repeated string kind = 4;
+}
+
+// Single-event lookup by `events.id`. Mirrors REST
+// `GET /v1/:chain/events/:id` — the verification companion to
+// bare SSE / streaming frames (spec §7.3).
+message GetEventByIdRequest {
+  string chain = 1;
+  // Postgres `events.id` (bigserial; positive int64). REST passes
+  // this as a path segment; gRPC carries it as a typed field.
+  int64 id = 2;
+
+  Safety safety = 10;
+  optional uint64 as_of_block = 11;
+  optional FreshQuote fresh_quote = 12;
+}
+
+// ---- Streaming envelope ----
+//
+// Wraps a single chain event with a fresh signature so streamed
+// frames are independently verifiable.
+
+message EventEnvelope {
+  google.protobuf.Struct event = 1;          // {block_number, log_index, tx_hash, ...}
+  google.protobuf.Struct as_of = 2;
+  Attestation attestation = 3;
+}
+
+// ---- Common request flags ----
+
+enum Safety {
+  // Default: serve the head; reorg-prone reads.
+  SAFETY_HEAD = 0;
+  // Block until finalized_block >= as_of_block.
+  SAFETY_FINALIZED = 1;
+}
+
+// Per-request fresh-quote opt-in. See spec §4.2.
+message FreshQuote {
+  // 0x-prefixed hex; mixed into the freshly-generated quote's
+  // report_data as keccak256(payload_hash || nonce).
+  string nonce = 1;
+}

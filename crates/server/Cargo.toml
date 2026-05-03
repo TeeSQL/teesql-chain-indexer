@@ -1,0 +1,80 @@
+[package]
+name = "teesql-chain-indexer-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "axum HTTP + SSE + gRPC routes wrapped in the signed-response envelope"
+
+[dependencies]
+# HTTP server stack.
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# gRPC mirror — same handler functions REST uses, served over tonic.
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = "0.13"
+
+# Async runtime + streams.
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+
+# Postgres for the SSE LISTEN/NOTIFY worker + cache + as-of lookups.
+sqlx = { workspace = true }
+
+# alloy is used here only for Address parsing/formatting on the route
+# boundary; everything stored in pg is bytea-as-bytes.
+alloy = { workspace = true }
+
+# Serde + canonicalization helpers.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Errors + tracing.
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Hex / base64 for the envelope hex/quote_b64 surfaces.
+hex = { workspace = true }
+chrono = { workspace = true }
+base64 = "0.22"
+
+# `async_stream::try_stream!` for the SSE handler — it composes a
+# replay query with a live broadcast::Receiver into one Stream
+# without hand-rolling unfold state. Pinned at the crates.io
+# current line; not in the workspace pins because no other crate
+# uses it yet.
+async-stream = "0.3"
+
+# k256 used by the envelope round-trip test for ECDSA recovery against
+# the real Signer's signatures.
+k256 = { workspace = true }
+sha3 = { workspace = true }
+
+# Local sibling crates: core owns EventStore + NotifyEvent + the View
+# trait; views supplies the materializer impls; attest supplies the
+# Signer + Attestation envelope.
+teesql-chain-indexer-core = { workspace = true }
+teesql-chain-indexer-views = { workspace = true }
+teesql-chain-indexer-attest = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+# Vendored protoc binary so the build doesn't depend on a system-
+# installed protobuf-compiler. Installed CVMs and CI runners alike
+# benefit from a hermetic toolchain. The binary lives in the
+# ~/.cargo registry build cache; nothing about it leaks into the
+# final teesql-chain-indexer binary.
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

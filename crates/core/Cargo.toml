@@ -1,0 +1,50 @@
+[package]
+name = "teesql-chain-indexer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Generic factory + child-contract event indexer (no TeeSQL types)"
+
+[dependencies]
+# EVM client. Pulls only what the ingest pipeline needs — provider HTTP + WS,
+# pubsub for log/header subscriptions, sol-types for keccak256 of event
+# signatures, rpc-types-eth for typed Log/Header decode.
+alloy = { workspace = true }
+
+# Postgres client. Workspace pin already wires runtime-tokio + tls-rustls.
+sqlx = { workspace = true }
+
+# RA-TLS connector around sqlx — used by `connection.rs`.
+sqlx-ra-tls = { workspace = true }
+
+# dstack guest-agent client — only re-exported for convenience; the
+# connector pulls it transitively via sqlx-ra-tls.
+dstack-sdk = { workspace = true }
+
+# Async runtime + traits.
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+
+# Serde / JSON
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling, logging.
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Encoding helpers.
+hex = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+alloy = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,70 @@
+# Production config for `teesql-chain-indexer` on Base mainnet.
+#
+# Layout matches spec §8 (`docs/specs/chain-indexer.md` in the parent
+# monorepo). The deploy script base64-encodes this file into
+# INDEXER_CONFIG_B64 inside the encrypted .env; the compose entrypoint
+# decodes it back to /etc/teesql-chain-indexer/config.toml at boot.
+#
+# RPC URLs ship with placeholder Alchemy paths — the operator replaces
+# the `__ALCHEMY_KEY__` token with a real key before encrypt + deploy.
+# Public RPCs (mainnet.base.org) are NOT acceptable here; the WS
+# subscription stays open indefinitely and public endpoints rate-limit
+# per-IP at ~20 req/s, which a single CVM can saturate inside a minute
+# (see CLAUDE.md memory `feedback_no_public_rpc_for_production`).
+
+[[chains]]
+shortname    = "base"
+chain_id     = 8453
+rpc_http_url = "https://base-mainnet.g.alchemy.com/v2/__ALCHEMY_KEY__"
+rpc_ws_url   = "wss://base-mainnet.g.alchemy.com/v2/__ALCHEMY_KEY__"
+
+# v4 ClusterDiamondFactory — single trust pin, every diamond it deploys
+# becomes a watched cluster. Address + from_block match what the
+# dns-controller's `[cluster_factory]` block consumes
+# (`deployments/dns-controller/monitor.config.toml`) so a side-by-side
+# diff against the dns-controller config is meaningful.
+[[chains.factories]]
+address    = "0xfbd65e6b30f40db87159a5d3a390fc9c2bd87e11"
+from_block = 45481400
+
+[storage]
+# Monitor cluster UUID. The sqlx-ra-tls dialer follows
+# `_teesql-leader.6dee00f10e.teesql.com` to the current primary; if
+# the monitor cluster is redeployed under a fresh UUID this value has
+# to move with it.
+cluster_uuid    = "6dee00f10e"
+database        = "chain_indexer"
+username        = "chain_indexer_writer"
+max_connections = 16
+
+[server]
+listen_addr         = "0.0.0.0:8080"
+rate_limit_rps      = 50
+sse_max_connections = 1000
+
+[grpc]
+# tonic mirror of the REST surface. Spec §7.2 — every JSON endpoint has
+# a 1:1 gRPC method under `teesql.chain_indexer.v1`. Bound on a sibling
+# port so the Phala gateway can map a single hostname onto both REST
+# (:8080) and gRPC (:8081). `enabled = false` skips the listener
+# entirely (dev escape hatch).
+listen_addr = "0.0.0.0:8081"
+enabled     = true
+
+[attestation]
+kms_purpose         = "teesql-chain-indexer-sign"
+response_lifetime_s = 300
+finality_depth      = 12
+
+[ra_tls]
+# Local DCAP via dcap-qvl. Same default as the hub since 2026-04-24
+# (see CLAUDE.md, "Mutual RA-TLS → DCAP migration plan"). The only
+# supported value in v1; `intel` (Intel Trust Authority round-trip)
+# is reserved for a future wiring of `IntelApiVerifier` and must be
+# added back to the config-load allowlist alongside that change.
+verifier         = "dcap"
+# Empty in v1. Once the monitor cluster's expected MRTDs are pinned at
+# the hub level the same allowlist drops in here verbatim.
+allowed_mrtds    = []
+allow_debug_mode = false
+allow_simulator  = false

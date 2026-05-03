@@ -1,0 +1,88 @@
+# teesql-chain-indexer compose file.
+#
+# Runtime values arrive via the Phala-encrypted .env at deploy time:
+#
+#   TEESQL_INDEXER_CLUSTER_SECRET — 64-char hex (32 bytes). The
+#       cluster-shared secret authenticating `chain_indexer_writer` to
+#       the monitor cluster's RA-TLS Postgres. Generated once and
+#       allowlisted in the monitor cluster's sidecar wire-protocol auth
+#       map; rotated via the same dance as `TEESQL_HUB_CLUSTER_SECRET`.
+#
+#   INDEXER_CONFIG_B64 — the prod.config.toml base64-encoded. Same
+#       trick the dns-controller + hub use to dodge Phala env
+#       substitution's newline / quote handling.
+#
+#   TEESQL_INDEXER_OVERRIDE_KEY — OPTIONAL, dev-only. 32 hex bytes that
+#       override the dstack-derived signing key. Set to the empty string
+#       in production; the attest crate hard-fails if it sees a non-
+#       empty value alongside `ra_tls.allow_simulator = false`.
+#
+#   INDEXER_IMAGE_TAG — set by `scripts/deploy-chain-indexer.sh` from
+#       the workspace `Cargo.toml` version. Substituted into `image:`
+#       at deploy-bundle render time, NOT at compose hash derivation
+#       time (Phala hashes the rendered file, so the operator-controlled
+#       tag locks the compose hash to a specific image).
+#
+#   DSTACK_DOCKER_REGISTRY/USERNAME/PASSWORD — Phala's pre-launch
+#       script reads these BEFORE the compose runs to `docker login`
+#       against GHCR. The chain-indexer image is public for now (see
+#       README), but listing the vars here keeps the compose
+#       compatible with a future flip to a private package without a
+#       fresh compose-hash allowlist round-trip. Empty values are fine
+#       when pulling a public image.
+
+services:
+  chain-indexer:
+    image: ghcr.io/teesql/teesql-chain-indexer:${INDEXER_IMAGE_TAG}
+    environment:
+      # Cluster-shared secret for RA-TLS Postgres auth. Required.
+      - TEESQL_INDEXER_CLUSTER_SECRET=${TEESQL_INDEXER_CLUSTER_SECRET}
+      # Base64-encoded TOML config. Required.
+      - INDEXER_CONFIG_B64=${INDEXER_CONFIG_B64}
+      # Tracing filter. Default `info,teesql_chain_indexer=debug` matches
+      # what `main_impl::run` falls back to when RUST_LOG is unset; this
+      # entry pins the value so operators can flip to `debug` without
+      # rebuilding.
+      - RUST_LOG=${RUST_LOG:-info,teesql_chain_indexer=debug}
+      # Dev escape hatch — empty in production. The attest crate refuses
+      # to consume this value unless `ra_tls.allow_simulator = true`.
+      - TEESQL_INDEXER_OVERRIDE_KEY=${TEESQL_INDEXER_OVERRIDE_KEY:-}
+      # Optional GHCR pull creds (see header comment).
+      - DSTACK_DOCKER_REGISTRY=${DSTACK_DOCKER_REGISTRY:-}
+      - DSTACK_DOCKER_USERNAME=${DSTACK_DOCKER_USERNAME:-}
+      - DSTACK_DOCKER_PASSWORD=${DSTACK_DOCKER_PASSWORD:-}
+    volumes:
+      # dstack guest-agent socket — used by both the attest crate
+      # (`get_key` for the response signer) and sqlx-ra-tls (mutual
+      # client cert against the monitor cluster's leader).
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    ports:
+      # Phala gateway maps the public hostname onto :8080 (REST/SSE)
+      # and :8081 (gRPC) — both transports under one hostname per
+      # spec §7.2. The axum server binds 0.0.0.0:8080 and the tonic
+      # gRPC mirror binds 0.0.0.0:8081 per the defaults in
+      # `deploy/prod.config.toml` (`server.listen_addr` and
+      # `grpc.listen_addr` respectively).
+      - "8080:8080"
+      - "8081:8081"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /etc/teesql-chain-indexer
+        printf '%s' "$$INDEXER_CONFIG_B64" | base64 -d \
+            > /etc/teesql-chain-indexer/config.toml
+        exec /usr/local/bin/teesql-chain-indexer \
+            --config /etc/teesql-chain-indexer/config.toml
+    healthcheck:
+      # /v1/health is unsigned (spec §7.1) so a TDX failure on the
+      # signing path doesn't mask "the process is up". 30s start period
+      # gives the cold-start backfill loop room to open the WS subscription
+      # and replay the chain-state cursor before health checks bite.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/v1/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
