@@ -346,24 +346,31 @@ async fn open_storage_pool(cfg: &Config) -> Result<sqlx::PgPool> {
             let manifest = resolve_leader_manifest(&record_name, &signer_bytes)
                 .await
                 .with_context(|| format!("resolve manifest TXT at {record_name}"))?;
-            let (host, port_opt) =
-                host_port_from_leader_url(&manifest.leader_url).with_context(|| {
-                    format!("parse host/port from leader_url `{}`", manifest.leader_url)
-                })?;
+            let addr = host_port_from_leader_url(&manifest.leader_url).with_context(|| {
+                format!("parse host/port from leader_url `{}`", manifest.leader_url)
+            })?;
+            // Scheme-aware default: `https://` lands at the Phala
+            // gateway's TCP 443, which routes to the cluster's
+            // internal port via the `-<port>s` suffix encoded in
+            // the hostname (`<instance_id>-5433s.<node>.phala.network`).
+            // Anything else (`http://localhost:5433`, an internal
+            // tailnet hostname, etc.) falls through to the cluster's
+            // postgres-side default 5433.
+            let scheme_default_port = if addr.https { 443 } else { DEFAULT_TARGET_PORT };
             let port = env_target_port
                 .map(|s| s.parse::<u16>())
                 .transpose()
                 .context("TEESQL_INDEXER_TARGET_PORT not a valid u16")?
-                .or(port_opt)
-                .unwrap_or(DEFAULT_TARGET_PORT);
+                .or(addr.explicit_port)
+                .unwrap_or(scheme_default_port);
             tracing::info!(
-                target_host = %host,
+                target_host = %addr.host,
                 target_port = port,
                 leader_instance = %manifest.leader_instance,
                 epoch = manifest.epoch,
                 "storage target resolved via manifest TXT"
             );
-            (host, port)
+            (addr.host, port)
         }
     };
 

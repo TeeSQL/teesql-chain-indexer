@@ -132,6 +132,31 @@ DEPLOY_NAME="${DEPLOY_NAME:-teesql-chain-indexer-${CONFIG_STEM}}"
 mkdir -p "${OUT_DIR}"
 cp "${CONFIG_SRC}" "${OUT_DIR}/config.toml"
 
+# Substitute `__ALCHEMY_KEY__` placeholder with the operator's key
+# from `~/.teesql/alchemy-api.key` (mirrors the dns-controller deploy
+# script). Public RPCs are NOT acceptable on production deployments
+# (rate limits — see CLAUDE.md memory
+# `feedback_no_public_rpc_for_production`); the placeholder ships in
+# the source TOML so `prod.config.toml` is safe to commit, and this
+# step replaces it at bundle render time. Skip silently when the
+# config doesn't contain the placeholder (an operator may have
+# baked a real URL into a custom config).
+ALCHEMY_KEY_FILE="${HOME}/.teesql/alchemy-api.key"
+if grep -q '__ALCHEMY_KEY__' "${OUT_DIR}/config.toml"; then
+    if [[ ! -f "${ALCHEMY_KEY_FILE}" ]]; then
+        echo "ERROR: config has __ALCHEMY_KEY__ placeholder but ${ALCHEMY_KEY_FILE} not found" >&2
+        echo "       Either drop the placeholder from ${CONFIG_SRC} or stash the key." >&2
+        exit 1
+    fi
+    ALCHEMY_KEY=$(tr -d '\n' < "${ALCHEMY_KEY_FILE}")
+    if [[ -z "${ALCHEMY_KEY}" ]]; then
+        echo "ERROR: ${ALCHEMY_KEY_FILE} is empty" >&2
+        exit 1
+    fi
+    sed -i.bak "s/__ALCHEMY_KEY__/${ALCHEMY_KEY}/g" "${OUT_DIR}/config.toml"
+    rm -f "${OUT_DIR}/config.toml.bak"
+fi
+
 # --- render compose ----------------------------------------------------------
 
 # Phala hashes the compose file as-rendered (see CLAUDE.md memory

@@ -198,28 +198,55 @@ pub async fn resolve_leader_manifest(
     Err(last_err.unwrap_or_else(|| anyhow!("no TXT records found at {record_name}")))
 }
 
+/// Parsed address pulled from a manifest's `leader_url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderAddress {
+    pub host: String,
+    /// Explicit port if the URL embedded one (e.g. `:8443/...`).
+    pub explicit_port: Option<u16>,
+    /// `true` when the URL uses `https://`. The Phala-gateway URL
+    /// shape (`<instance_id>-<internal_port>s.<node>.phala.network`)
+    /// always lands at 443 — the `-<port>s` suffix in the hostname
+    /// is what the gateway uses to route to the internal port. So
+    /// callers should default to 443 (not the cluster's internal
+    /// 5433) when `https = true` and no explicit port.
+    pub https: bool,
+}
+
 /// Pull `host[:port]` out of `https://host:port/...` (or `http://`).
-/// Returns `(host, Some(port))` when an explicit port was present in
-/// the URL, otherwise `(host, None)` so callers can apply their own
-/// default. Used to convert the manifest's `leader_url` into the
-/// `target_host` + `target_port` `ConnectionConfig` expects.
-pub fn host_port_from_leader_url(url: &str) -> Result<(String, Option<u16>)> {
-    let stripped = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
+/// Used to convert the manifest's `leader_url` into the connection's
+/// dial target. Callers apply the scheme-aware port default.
+pub fn host_port_from_leader_url(url: &str) -> Result<LeaderAddress> {
+    let (https, stripped) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        (false, url)
+    };
     // Cut at the first `/` so a path doesn't leak into the host.
     let authority = stripped.split('/').next().unwrap_or(stripped);
     if let Some((host, port)) = authority.rsplit_once(':') {
         // IPv6 forms (`[::1]:5433`) — keep the bracket.
         if host.starts_with('[') && !host.ends_with(']') {
-            // Not a port separator; treat the whole authority as host.
-            return Ok((authority.to_string(), None));
+            return Ok(LeaderAddress {
+                host: authority.to_string(),
+                explicit_port: None,
+                https,
+            });
         }
         let port: u16 = port.parse().context("port parse")?;
-        Ok((host.to_string(), Some(port)))
+        Ok(LeaderAddress {
+            host: host.to_string(),
+            explicit_port: Some(port),
+            https,
+        })
     } else {
-        Ok((authority.to_string(), None))
+        Ok(LeaderAddress {
+            host: authority.to_string(),
+            explicit_port: None,
+            https,
+        })
     }
 }
 
@@ -299,18 +326,28 @@ mod tests {
 
     #[test]
     fn host_port_from_phala_gateway_url() {
-        let (h, p) = host_port_from_leader_url(
-            "https://c7499cdcef3404fddcb46b9acf53cbc64a865473-5432.dstack-base-prod4.phala.network",
+        let addr = host_port_from_leader_url(
+            "https://c7499cdcef3404fddcb46b9acf53cbc64a865473-5433s.dstack-base-prod4.phala.network",
         )
         .unwrap();
         assert_eq!(
-            h,
-            "c7499cdcef3404fddcb46b9acf53cbc64a865473-5432.dstack-base-prod4.phala.network"
+            addr.host,
+            "c7499cdcef3404fddcb46b9acf53cbc64a865473-5433s.dstack-base-prod4.phala.network"
         );
-        assert_eq!(p, None);
+        assert_eq!(addr.explicit_port, None);
+        assert!(
+            addr.https,
+            "Phala gateway URL is https → caller defaults to 443"
+        );
 
-        let (h, p) = host_port_from_leader_url("https://example.com:8443/path/here").unwrap();
-        assert_eq!(h, "example.com");
-        assert_eq!(p, Some(8443));
+        let addr = host_port_from_leader_url("https://example.com:8443/path/here").unwrap();
+        assert_eq!(addr.host, "example.com");
+        assert_eq!(addr.explicit_port, Some(8443));
+        assert!(addr.https);
+
+        let addr = host_port_from_leader_url("http://localhost:5433").unwrap();
+        assert_eq!(addr.host, "localhost");
+        assert_eq!(addr.explicit_port, Some(5433));
+        assert!(!addr.https);
     }
 }
