@@ -153,13 +153,37 @@ echo "==> Verifying ${IMAGE} is reachable on GHCR"
 # deploy attempt fails far away from the publish step with a confusing
 # `manifest unknown` boot loop. See CLAUDE.md memory
 # `feedback_verify_image_pushed`.
-if ! docker manifest inspect "${IMAGE}" >/dev/null; then
+#
+# We capture the output so we can surface the digest in the success
+# line — Phala deploys pin by digest, not tag, so the orchestrator
+# needs this value visible in the publish log.
+if ! MANIFEST_JSON=$(docker manifest inspect "${IMAGE}" 2>&1); then
     echo "ERROR: ${IMAGE} manifest not reachable after push" >&2
+    echo "${MANIFEST_JSON}" >&2
+    exit 1
+fi
+DIGEST=$(printf '%s' "${MANIFEST_JSON}" \
+    | grep -oE '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]+"' \
+    | head -1 \
+    | sed -E 's/.*"(sha256:[0-9a-f]+)".*/\1/')
+
+# Cross-check via the GHCR package API. `docker manifest inspect` can
+# succeed against a stale local manifest cache (rare but observed),
+# while the package-versions endpoint hits authoritative GHCR metadata.
+# Belt-and-suspenders: a discrepancy here means the push didn't fully
+# land even if the local docker thinks it did.
+echo "==> Cross-checking via GHCR package API"
+if ! gh api "orgs/TeeSQL/packages/container/teesql-chain-indexer/versions" \
+        --jq "any(.[].metadata.container.tags[]?; . == \"${TAG}\")" \
+        2>/dev/null \
+        | grep -qx 'true'; then
+    echo "ERROR: GHCR package API has no version tagged ${TAG}" >&2
     exit 1
 fi
 
 echo
 echo "Done. Image published: ${IMAGE}"
+echo "       Digest: ${DIGEST}"
 echo
 echo "Next: ./scripts/deploy-chain-indexer.sh ${TAG}"
 echo "      (or pass deploy/prod.config.toml + node id explicitly — see"

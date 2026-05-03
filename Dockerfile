@@ -22,7 +22,7 @@
 # `cargo build --release` line below, plus a workspace-version bump.
 
 # syntax=docker/dockerfile:1.6
-FROM rust:1.83-slim AS builder
+FROM rust:1.86-slim AS builder
 WORKDIR /build
 
 # System deps:
