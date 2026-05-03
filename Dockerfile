@@ -22,7 +22,12 @@
 # `cargo build --release` line below, plus a workspace-version bump.
 
 # syntax=docker/dockerfile:1.6
-FROM rust:1.92-slim AS builder
+# The explicit `-bookworm` tag pins the builder's glibc to the runtime's
+# (debian:bookworm-slim, glibc 2.36). The bare `rust:1.92-slim` tag now
+# resolves to Debian 13 trixie (glibc 2.41), which produces a binary the
+# bookworm runtime can't load (`GLIBC_2.38 not found`, CVM boot loop).
+# This was the v0.1.2 breakage; fixed in v0.1.3 onward.
+FROM rust:1.92-slim-bookworm AS builder
 WORKDIR /build
 
 # System deps:
