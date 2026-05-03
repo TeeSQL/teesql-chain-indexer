@@ -33,3 +33,12 @@ tokio-stream = { workspace = true }
 axum = { workspace = true }
 tonic = { workspace = true }
 hex = { workspace = true }
+
+# Signed leader manifest discovery — used when
+# `TEESQL_INDEXER_TARGET_HOST` is unset and the storage layer should
+# follow `_teesql-leader.<cluster_uuid>.teesql.com` to whichever
+# cluster member is currently primary. `sha3` + `k256` recover the
+# manifest signer to compare against the operator-pinned address.
+hickory-resolver = { workspace = true }
+sha3 = { workspace = true }
+k256 = { workspace = true }

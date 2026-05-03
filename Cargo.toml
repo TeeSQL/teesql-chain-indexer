@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["TeeSQL contributors"]
@@ -127,3 +127,11 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+
+# DNS TXT resolver — used by the storage layer's manifest-TXT
+# discovery fallback when the operator hasn't pinned
+# `TEESQL_INDEXER_TARGET_HOST`. Same pin the parent monorepo's
+# `crates/common` uses for the dns-controller's signed-manifest
+# resolver, so cargo resolves a single copy when the indexer is
+# built inside the monorepo's worktree.
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }

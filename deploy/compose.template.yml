@@ -47,6 +47,16 @@ services:
       # Dev escape hatch — empty in production. The attest crate refuses
       # to consume this value unless `ra_tls.allow_simulator = true`.
       - TEESQL_INDEXER_OVERRIDE_KEY=${TEESQL_INDEXER_OVERRIDE_KEY:-}
+      # Manifest-TXT override. Empty = use manifest TXT lookup
+      # (the steady-state default). v0.1.4+ resolves
+      # `_teesql-leader.<cluster_uuid>.teesql.com` and verifies
+      # against `[storage] manifest_signer_address` from the TOML
+      # config; leader rotations propagate without operator action.
+      # Set TEESQL_INDEXER_TARGET_HOST only for testing or when the
+      # dns-controller hasn't published the manifest yet (e.g.
+      # initial cluster bring-up).
+      - TEESQL_INDEXER_TARGET_HOST=${TEESQL_INDEXER_TARGET_HOST:-}
+      - TEESQL_INDEXER_TARGET_PORT=${TEESQL_INDEXER_TARGET_PORT:-}
       # Optional GHCR pull creds (see header comment).
       - DSTACK_DOCKER_REGISTRY=${DSTACK_DOCKER_REGISTRY:-}
       - DSTACK_DOCKER_USERNAME=${DSTACK_DOCKER_USERNAME:-}

@@ -19,11 +19,25 @@
 
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::{routing::get, Json, Router};
+use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
 use crate::metrics::Metrics;
 use crate::state::MultiChainState;
+
+/// `GET /` — unsigned service-info banner. First-time visitors at
+/// `https://chain-indexer.teesql.com/` would otherwise hit a 404 and
+/// bounce; this lands a one-shot pointer to the docs + the actual
+/// `/v1/*` API surface. Cheap; no chain state lookup.
+async fn root_info() -> Json<Value> {
+    Json(json!({
+        "service": "teesql-chain-indexer",
+        "version": env!("CARGO_PKG_VERSION"),
+        "docs": "https://github.com/TeeSQL/teesql-chain-indexer",
+        "api": "all endpoints under /v1/*"
+    }))
+}
 
 pub mod attestation;
 pub mod chains;
@@ -96,6 +110,7 @@ pub fn router(state: Arc<MultiChainState>, metrics: Arc<Metrics>) -> Router {
         .with_state(metrics);
 
     Router::new()
+        .route("/", get(root_info))
         .nest("/v1", v1.merge(metrics_router))
         .layer(CorsLayer::permissive())
 }

@@ -396,15 +396,14 @@ async fn listen_loop(
     listener.listen("chain_indexer_events").await?;
     while let Some(notification) = listener.try_recv().await? {
         let payload = notification.payload();
-        match serde_json::from_str::<NotifyPayload>(payload) {
-            Ok(parsed) => {
-                let ev = match NotifyEvent::try_from(parsed) {
-                    Ok(ev) => ev,
-                    Err(e) => {
-                        tracing::warn!(error = %e, payload, "drop unparseable LISTEN payload");
-                        continue;
-                    }
-                };
+        // `NotifyEvent`'s serde representation matches the pg_notify
+        // payload byte-for-byte (cluster as 0x-hex string). The earlier
+        // intermediate `NotifyPayload` shape was redundant and
+        // accumulated drift from the producer side; deserializing
+        // straight into `NotifyEvent` keeps producer + consumer locked
+        // to a single canonical wire form.
+        match serde_json::from_str::<NotifyEvent>(payload) {
+            Ok(ev) => {
                 // Best-effort send. No subscribers → drop on the floor.
                 let _ = sender.send(ev);
             }
@@ -414,37 +413,6 @@ async fn listen_loop(
         }
     }
     Ok(())
-}
-
-/// On-the-wire shape of `pg_notify('chain_indexer_events', json)`.
-/// Mirrors what `core::Ingestor` writes after every event insert.
-#[derive(Debug, Deserialize)]
-struct NotifyPayload {
-    cluster: String, // 0x-prefixed hex
-    kind: String,
-    event_id: i64,
-    block_number: u64,
-    log_index: i32,
-}
-
-impl TryFrom<NotifyPayload> for NotifyEvent {
-    type Error = anyhow::Error;
-    fn try_from(p: NotifyPayload) -> Result<Self, Self::Error> {
-        let raw = p.cluster.strip_prefix("0x").unwrap_or(&p.cluster);
-        let bytes = hex::decode(raw)?;
-        if bytes.len() != 20 {
-            anyhow::bail!("cluster address must be 20 bytes");
-        }
-        let mut cluster = [0u8; 20];
-        cluster.copy_from_slice(&bytes);
-        Ok(NotifyEvent {
-            cluster,
-            kind: p.kind,
-            event_id: p.event_id,
-            block_number: p.block_number,
-            log_index: p.log_index,
-        })
-    }
 }
 
 #[cfg(test)]

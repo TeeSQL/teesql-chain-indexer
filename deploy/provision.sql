@@ -74,9 +74,21 @@ CREATE TABLE watched_contracts (
 );
 
 -- Raw event log — append-only, source of truth.
--- Partitioned by 100k-block ranges so we can drop very old partitions
--- without a slow DELETE if retention pressure ever shows up. Sub-partition
--- by chain_id at the LIST level so multi-chain writes don't hot-spot.
+--
+-- Earlier revisions of this file declared `PARTITION BY RANGE
+-- (block_number)`, but the unique dedup index `events_dedup_idx`
+-- (`chain_id, contract, block_hash, log_index`) doesn't include
+-- `block_number`, and Postgres rejects unique indexes on partitioned
+-- tables that don't cover the partition key. Two ways out: (a) widen
+-- the dedup index to include `block_number` AND change the
+-- `ON CONFLICT` clause in `crates/core/src/store.rs::insert_event` to
+-- match, or (b) drop partitioning until v0.1.x actually grows
+-- partition-management code. We picked (b) — the code base has no
+-- partition rollover / drop logic yet, the spec drift was producing a
+-- table operators couldn't create from scratch, and a single TeeSQL-
+-- internal cluster's event volume is well below partition-pressure
+-- territory. Re-introduce in a future release alongside the
+-- partition-management code.
 CREATE TABLE events (
   id            bigserial NOT NULL,
   chain_id      int NOT NULL,
@@ -93,7 +105,7 @@ CREATE TABLE events (
   removed       boolean NOT NULL DEFAULT false,-- flipped true on reorg rollback
   ingested_at   timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (chain_id, block_number, id)
-) PARTITION BY RANGE (block_number);
+);
 
 CREATE UNIQUE INDEX events_dedup_idx ON events (chain_id, contract, block_hash, log_index);
 CREATE INDEX events_contract_kind_idx ON events (chain_id, contract, decoded_kind, block_number);
@@ -171,5 +183,12 @@ CREATE TABLE historical_query_cache (
 );
 CREATE INDEX historical_query_cache_lru ON historical_query_cache (cached_at);
 
--- TODO: spec §5 references chain_indexer schema while tables are in public; flagged for spec-reconcile.
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA chain_indexer TO chain_indexer_reader;
+-- Sequence access for chain_indexer_reader. Earlier revisions wrote
+-- `IN SCHEMA chain_indexer`, which silently broke the script — no
+-- `chain_indexer` schema exists; tables live in `public`. The
+-- `ALTER DEFAULT PRIVILEGES` block above already covers SELECTs on
+-- sequences created later; this explicit GRANT covers the bigserial
+-- the events table created when this script ran. Keep both: the
+-- ALTER handles future sequences, the GRANT handles already-created
+-- ones.
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO chain_indexer_reader;

@@ -72,10 +72,23 @@ const WATCHED_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Notification fan-out payload. Sent on the in-process mpsc when the
 /// builder was given one, AND serialised + handed to `pg_notify`.
+///
+/// `cluster` ships on the wire as a 0x-prefixed 20-byte hex string
+/// rather than the default serde `[u8; 20]` (which would emit a JSON
+/// array of u8s). The string shape is what every cross-process
+/// consumer expects: `pg_notify` payloads, REST/SSE clients, and the
+/// `LISTEN chain_indexer_events` worker that re-hydrates back into
+/// `NotifyEvent`. The byte-array default would break round-trip
+/// deserialization on the LISTEN path (`invalid type: sequence,
+/// expected a string`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NotifyEvent {
     /// Address that emitted the event. `[u8; 20]` rather than `Address`
     /// so consumers don't need alloy on the receive side.
+    #[serde(
+        serialize_with = "serialize_cluster_hex",
+        deserialize_with = "deserialize_cluster_hex"
+    )]
     pub cluster: [u8; 20],
     /// Decoded `Decoder.kind()` value. `unknown` when no decoder
     /// matched — kept as a non-empty string so JSON consumers can
@@ -85,6 +98,26 @@ pub struct NotifyEvent {
     pub event_id: i64,
     pub block_number: u64,
     pub log_index: i32,
+}
+
+fn serialize_cluster_hex<S: serde::Serializer>(addr: &[u8; 20], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&format!("0x{}", hex::encode(addr)))
+}
+
+fn deserialize_cluster_hex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 20], D::Error> {
+    use serde::de::Error;
+    let s: String = serde::Deserialize::deserialize(d)?;
+    let raw = s.strip_prefix("0x").unwrap_or(&s);
+    let bytes = hex::decode(raw).map_err(D::Error::custom)?;
+    if bytes.len() != 20 {
+        return Err(D::Error::custom(format!(
+            "cluster address must be 20 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// Long-running ingest engine. One per chain.
@@ -614,6 +647,31 @@ impl Ingestor {
             view.apply(&self.store, &event).await?;
         }
 
+        // Auto-register child diamonds emitted by a watched factory.
+        // Spec §6.1 step 6 — every `ClusterDeployed` from a factory
+        // becomes a new `cluster_diamond` watched_contract entry,
+        // anchored to the deploy block so backfill picks up the
+        // diamond's own event surface from the moment it was minted.
+        // The cold-start refresh tick + steady-state watched-set
+        // monitor in `steady_state_once` notice the new row and
+        // re-subscribe.
+        if event.kind.as_deref() == Some("ClusterDeployed") {
+            if let Err(e) = self.register_deployed_diamond(&event).await {
+                // Don't fail the whole event apply on a registry write
+                // hiccup — the next ClusterDeployed re-application
+                // (WS replay, restart, or operator-driven backfill) is
+                // idempotent and will retry. Log loudly so the gap is
+                // visible.
+                tracing::warn!(
+                    chain_id = self.chain_id,
+                    block = event.block_number,
+                    log_index = event.log_index,
+                    error = %e,
+                    "auto-register ClusterDeployed diamond failed; retry on next replay"
+                );
+            }
+        }
+
         let kind = event.kind.clone().unwrap_or_else(|| "unknown".to_string());
         let payload = NotifyEvent {
             cluster: event.contract,
@@ -636,6 +694,52 @@ impl Ingestor {
             }
         }
 
+        Ok(())
+    }
+
+    /// Decode a `ClusterDeployed` event and add the freshly-minted
+    /// diamond to `watched_contracts`. The factory event was already
+    /// recorded (its `event.contract` is the factory itself); this
+    /// extra step bootstraps the per-diamond watcher without waiting
+    /// for an operator to add the address by hand or for the
+    /// `listClusters()` cold-start path to re-discover it on restart.
+    async fn register_deployed_diamond(&self, event: &DecodedEvent) -> anyhow::Result<()> {
+        let payload = event
+            .decoded
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ClusterDeployed has no decoded payload"))?;
+        let diamond_str = payload
+            .get("diamond")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("ClusterDeployed payload missing `diamond` field"))?;
+        let raw = diamond_str.strip_prefix("0x").unwrap_or(diamond_str);
+        let bytes = hex::decode(raw)
+            .map_err(|e| anyhow::anyhow!("ClusterDeployed.diamond not hex: {e}"))?;
+        let diamond: [u8; 20] = bytes.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "ClusterDeployed.diamond expected 20 bytes, got {}",
+                bytes.len()
+            )
+        })?;
+        // `add_watched_contract` is idempotent (`ON CONFLICT DO
+        // NOTHING`) so re-application via WS replay / cold-start is
+        // safe. Anchor `from_block` to the deploy block so backfill
+        // doesn't waste scans on pre-deploy ranges.
+        self.store
+            .add_watched_contract(
+                diamond,
+                "cluster_diamond",
+                Some(event.contract),
+                event.block_number,
+            )
+            .await?;
+        tracing::info!(
+            chain_id = self.chain_id,
+            factory = %hex::encode(event.contract),
+            diamond = %hex::encode(diamond),
+            from_block = event.block_number,
+            "auto-registered ClusterDeployed diamond"
+        );
         Ok(())
     }
 
@@ -810,5 +914,35 @@ mod tests {
         assert_eq!(back.event_id, n.event_id);
         assert_eq!(back.block_number, n.block_number);
         assert_eq!(back.log_index, n.log_index);
+    }
+
+    /// `cluster` MUST land on the wire as a 0x-prefixed hex string,
+    /// not a JSON byte array. The LISTEN consumer (`server::sse`'s
+    /// listen_loop) expects this shape; the byte-array default would
+    /// break re-hydration with `invalid type: sequence, expected a
+    /// string`. Pin both directions in this test so any future
+    /// regression to the default shape fails here.
+    #[test]
+    fn notify_event_cluster_serializes_as_hex_string() {
+        let n = NotifyEvent {
+            cluster: [0xab; 20],
+            kind: "MemberRegistered".into(),
+            event_id: 42,
+            block_number: 1234,
+            log_index: 7,
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        let cluster = v
+            .get("cluster")
+            .expect("cluster field present")
+            .as_str()
+            .expect("cluster serialized as string");
+        assert_eq!(cluster, "0xabababababababababababababababababababab");
+
+        // Round-trip from a JSON object literal (the shape pg_notify
+        // payload consumers see) succeeds.
+        let raw = r#"{"cluster":"0xabababababababababababababababababababab","kind":"MemberRegistered","event_id":42,"block_number":1234,"log_index":7}"#;
+        let back: NotifyEvent = serde_json::from_str(raw).unwrap();
+        assert_eq!(back.cluster, [0xab; 20]);
     }
 }

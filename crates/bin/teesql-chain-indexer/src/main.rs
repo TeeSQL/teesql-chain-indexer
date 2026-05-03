@@ -9,6 +9,7 @@
 
 mod config;
 mod main_impl;
+mod manifest_resolver;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

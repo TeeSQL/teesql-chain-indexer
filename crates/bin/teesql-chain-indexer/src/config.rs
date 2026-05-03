@@ -111,6 +111,23 @@ pub struct StorageConfig {
     /// sqlx pool size cap. Spec §8 default is 16.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+
+    /// Operator-pinned dns-controller manifest signer address. Used
+    /// when `TEESQL_INDEXER_TARGET_HOST` is unset and the storage
+    /// layer falls back to resolving + verifying the signed leader
+    /// manifest at `_teesql-leader.<cluster_uuid>.teesql.com`. The
+    /// signer corresponds to the dns-controller's KMS-derived signing
+    /// key for the `teesql-manifest-sign` purpose; an operator
+    /// captures it from the dns-controller's boot log
+    /// (`signing key ready signer_address=0x…`) and pins it here.
+    ///
+    /// `0x` + 40 hex when set. Optional — when unset AND
+    /// `TEESQL_INDEXER_TARGET_HOST` is unset, startup fails because
+    /// there's nothing to point the dialer at. When the env var IS
+    /// set, this field is unused (the env override is the explicit
+    /// operator-driven path).
+    #[serde(default)]
+    pub manifest_signer_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

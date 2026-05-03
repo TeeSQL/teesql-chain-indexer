@@ -28,14 +28,26 @@ address    = "0xfbd65e6b30f40db87159a5d3a390fc9c2bd87e11"
 from_block = 45481400
 
 [storage]
-# Monitor cluster UUID. The sqlx-ra-tls dialer follows
-# `_teesql-leader.6dee00f10e.teesql.com` to the current primary; if
-# the monitor cluster is redeployed under a fresh UUID this value has
-# to move with it.
-cluster_uuid    = "6dee00f10e"
+# Cluster UUID of whichever cluster hosts the chain_indexer DB. The
+# sqlx-ra-tls dialer follows
+# `_teesql-leader.<cluster_uuid>.teesql.com` to the current primary;
+# if the storage backend is redeployed under a fresh UUID this value
+# has to move with it. Currently the platform cluster
+# (`fbdacec943`) post-2026-05-03 burndown.
+cluster_uuid    = "fbdacec943"
 database        = "chain_indexer"
 username        = "chain_indexer_writer"
 max_connections = 16
+# Pinned dns-controller manifest-signer for the platform cluster's
+# `_teesql-leader.fbdacec943.teesql.com` TXT record. Captured from
+# the dns-controller's boot log
+# (`signing key ready signer_address=0x…`). Required when neither
+# `TEESQL_INDEXER_TARGET_HOST` nor `TEESQL_INDEXER_TARGET_PORT` is
+# set in the encrypted env (the steady-state default — manifest TXT
+# discovery follows the current leader without operator intervention).
+# Override with TEESQL_INDEXER_TARGET_HOST during initial bring-up
+# when the dns-controller hasn't published the manifest yet.
+manifest_signer_address = "0xe5ef39a2a1ad344c6d15cfb932e5279a4fb88633"
 
 [server]
 listen_addr         = "0.0.0.0:8080"

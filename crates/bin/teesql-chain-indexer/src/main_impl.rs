@@ -38,6 +38,7 @@ use teesql_chain_indexer_server::state::{AppState, MultiChainState, ServerConfig
 use teesql_chain_indexer_server::{build_grpc_service, build_router, spawn_listen_worker};
 
 use crate::config::{ChainConfig, Config};
+use crate::manifest_resolver::{host_port_from_leader_url, resolve_leader_manifest};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -283,22 +284,89 @@ pub async fn run() -> Result<()> {
     res.context("indexer task exited")
 }
 
-/// Build the sqlx-ra-tls pool against the monitor cluster's primary.
-/// `target_host` and the wire-level password are read from env vars
-/// (Phala-encrypted at deploy time) per spec §8.
+/// Build the sqlx-ra-tls pool against the cluster's current primary.
+///
+/// Two paths to a `target_host`:
+///
+/// 1. **Operator override.** `TEESQL_INDEXER_TARGET_HOST` set in the
+///    encrypted env. Used for first-time bring-up when the
+///    dns-controller hasn't yet published the cluster's leader-TXT
+///    manifest, or for testing against a pinned host. The
+///    accompanying `TEESQL_INDEXER_TARGET_PORT` defaults to 5433.
+///
+/// 2. **Manifest-TXT discovery (default).** When the env var is
+///    unset, resolve `_teesql-leader.<cluster_uuid>.teesql.com`,
+///    verify the dns-controller's signature against
+///    `[storage] manifest_signer_address`, and use the manifest's
+///    `leader_url` as the target. This is the normal steady-state
+///    path — leader rotations propagate automatically without an
+///    operator-driven env-var update.
 async fn open_storage_pool(cfg: &Config) -> Result<sqlx::PgPool> {
-    let target_host = std::env::var(ENV_TARGET_HOST).with_context(|| {
-        format!(
-            "env {} not set; resolve _teesql-leader.{}.teesql.com and feed the answer in",
-            ENV_TARGET_HOST, cfg.storage.cluster_uuid
-        )
-    })?;
-    let target_port = std::env::var(ENV_TARGET_PORT)
+    let env_target_host = std::env::var(ENV_TARGET_HOST)
         .ok()
-        .map(|s| s.parse::<u16>())
-        .transpose()
-        .context("TEESQL_INDEXER_TARGET_PORT not a valid u16")?
-        .unwrap_or(DEFAULT_TARGET_PORT);
+        .filter(|s| !s.is_empty());
+    let env_target_port = std::env::var(ENV_TARGET_PORT)
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    let (target_host, target_port) = match env_target_host {
+        Some(host) => {
+            let port = env_target_port
+                .map(|s| s.parse::<u16>())
+                .transpose()
+                .context("TEESQL_INDEXER_TARGET_PORT not a valid u16")?
+                .unwrap_or(DEFAULT_TARGET_PORT);
+            tracing::info!(
+                target_host = %host,
+                target_port = port,
+                "storage target via TEESQL_INDEXER_TARGET_HOST override"
+            );
+            (host, port)
+        }
+        None => {
+            let signer_str = cfg
+                .storage
+                .manifest_signer_address
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "neither {} is set nor [storage] manifest_signer_address is \
+                         configured; one of the two is required to discover the \
+                         cluster's primary",
+                        ENV_TARGET_HOST
+                    )
+                })?;
+            let signer_bytes = parse_signer_address(signer_str)?;
+            let record_name = format!("_teesql-leader.{}.teesql.com", cfg.storage.cluster_uuid);
+            tracing::info!(
+                record = %record_name,
+                signer = %signer_str,
+                "resolving signed leader manifest"
+            );
+            let manifest = resolve_leader_manifest(&record_name, &signer_bytes)
+                .await
+                .with_context(|| format!("resolve manifest TXT at {record_name}"))?;
+            let (host, port_opt) =
+                host_port_from_leader_url(&manifest.leader_url).with_context(|| {
+                    format!("parse host/port from leader_url `{}`", manifest.leader_url)
+                })?;
+            let port = env_target_port
+                .map(|s| s.parse::<u16>())
+                .transpose()
+                .context("TEESQL_INDEXER_TARGET_PORT not a valid u16")?
+                .or(port_opt)
+                .unwrap_or(DEFAULT_TARGET_PORT);
+            tracing::info!(
+                target_host = %host,
+                target_port = port,
+                leader_instance = %manifest.leader_instance,
+                epoch = manifest.epoch,
+                "storage target resolved via manifest TXT"
+            );
+            (host, port)
+        }
+    };
+
     let password_secret = std::env::var(ENV_CLUSTER_SECRET)
         .with_context(|| format!("env {} not set", ENV_CLUSTER_SECRET))?;
 
@@ -361,4 +429,12 @@ fn decode_address(s: &str) -> Result<[u8; 20]> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("expected 20 bytes after hex decode"))?;
     Ok(arr)
+}
+
+/// Parse `[storage] manifest_signer_address`. Same shape as
+/// `decode_address` but with a friendlier error message that points
+/// the operator at the config field they probably typo'd.
+fn parse_signer_address(s: &str) -> Result<[u8; 20]> {
+    decode_address(s)
+        .with_context(|| format!("storage.manifest_signer_address `{s}` is not 0x + 40 hex"))
 }
