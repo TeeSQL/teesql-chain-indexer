@@ -170,6 +170,16 @@ impl Ingestor {
             "ingestor starting cold-start backfill"
         );
 
+        // Replay historical ClusterDeployed events into
+        // `watched_contracts`. Older indexer revisions decoded the
+        // event but never auto-registered the diamond, leaving
+        // already-indexed clusters invisible to the per-diamond
+        // ingest loop. This pass is idempotent (`add_watched_contract`
+        // does ON CONFLICT DO NOTHING) so it's safe to run on every
+        // boot — its job is to backfill old gaps without disturbing
+        // anything else.
+        self.rehydrate_watched_diamonds().await?;
+
         // Persist a snapshot of the chain head so the cold-start loop
         // has a stable target. New blocks arriving during backfill
         // are caught by the reconnect/catchup path the steady-state
@@ -188,6 +198,87 @@ impl Ingestor {
         );
 
         self.steady_state_loop().await
+    }
+
+    /// Walk the `events` table for every prior ClusterDeployed and
+    /// register the diamond into `watched_contracts`. Closes the gap
+    /// where an older indexer revision recorded the factory event
+    /// without bootstrapping the per-diamond watcher — without this
+    /// pass, a v0.1.3-era cursor that's already past the diamond's
+    /// deploy block would never re-decode the event and the cluster
+    /// would stay invisible to read endpoints + downstream consumers.
+    async fn rehydrate_watched_diamonds(&self) -> anyhow::Result<()> {
+        let rows = sqlx::query(
+            "SELECT contract, block_number, decoded \
+             FROM events \
+             WHERE chain_id = $1 AND decoded_kind = 'ClusterDeployed' AND removed = false \
+             ORDER BY block_number, log_index",
+        )
+        .bind(self.chain_id)
+        .fetch_all(self.store.pool())
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut added = 0usize;
+        for row in rows {
+            use sqlx::Row as _;
+            let factory_bytes: Vec<u8> = row.try_get("contract")?;
+            let block_number_i64: i64 = row.try_get("block_number")?;
+            let decoded: Option<serde_json::Value> = row.try_get("decoded")?;
+            let Some(payload) = decoded else { continue };
+            let Some(diamond_str) = payload.get("diamond").and_then(|v| v.as_str()) else {
+                tracing::warn!(
+                    block = block_number_i64,
+                    "rehydrate: ClusterDeployed payload missing `diamond` field"
+                );
+                continue;
+            };
+            let raw = diamond_str.strip_prefix("0x").unwrap_or(diamond_str);
+            let bytes = match hex::decode(raw) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        block = block_number_i64,
+                        diamond = diamond_str,
+                        error = %e,
+                        "rehydrate: ClusterDeployed.diamond not hex"
+                    );
+                    continue;
+                }
+            };
+            let diamond: [u8; 20] = match bytes.as_slice().try_into() {
+                Ok(b) => b,
+                Err(_) => {
+                    tracing::warn!(
+                        block = block_number_i64,
+                        diamond = diamond_str,
+                        len = bytes.len(),
+                        "rehydrate: ClusterDeployed.diamond expected 20 bytes"
+                    );
+                    continue;
+                }
+            };
+            let factory: [u8; 20] = factory_bytes.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!("ClusterDeployed event row has malformed contract column")
+            })?;
+            let from_block = u64::try_from(block_number_i64).map_err(|_| {
+                anyhow::anyhow!("rehydrate: block_number {block_number_i64} negative")
+            })?;
+            self.store
+                .add_watched_contract(diamond, "cluster_diamond", Some(factory), from_block)
+                .await?;
+            added += 1;
+        }
+
+        tracing::info!(
+            chain_id = self.chain_id,
+            count = added,
+            "rehydrate: replayed ClusterDeployed events into watched_contracts"
+        );
+        Ok(())
     }
 
     /// Resolve the current chain head over HTTPS. Used as the
