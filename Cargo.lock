@@ -5269,7 +5269,7 @@ dependencies = [
 
 [[package]]
 name = "sqlx-ra-tls"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5286,6 +5286,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
@@ -5540,6 +5541,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "http-body-util",
  "k256",
  "prost",
  "prost-types",

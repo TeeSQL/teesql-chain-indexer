@@ -78,3 +78,8 @@ protoc-bin-vendored = "3"
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+# Route handler tests stand up an in-process axum router and call it
+# via tower::ServiceExt::oneshot — no real Postgres needed for the
+# unsigned `/v1/health` and `/v1/attestation` paths.
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"

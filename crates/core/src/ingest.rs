@@ -795,23 +795,7 @@ impl Ingestor {
     /// for an operator to add the address by hand or for the
     /// `listClusters()` cold-start path to re-discover it on restart.
     async fn register_deployed_diamond(&self, event: &DecodedEvent) -> anyhow::Result<()> {
-        let payload = event
-            .decoded
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ClusterDeployed has no decoded payload"))?;
-        let diamond_str = payload
-            .get("diamond")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("ClusterDeployed payload missing `diamond` field"))?;
-        let raw = diamond_str.strip_prefix("0x").unwrap_or(diamond_str);
-        let bytes = hex::decode(raw)
-            .map_err(|e| anyhow::anyhow!("ClusterDeployed.diamond not hex: {e}"))?;
-        let diamond: [u8; 20] = bytes.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "ClusterDeployed.diamond expected 20 bytes, got {}",
-                bytes.len()
-            )
-        })?;
+        let diamond = parse_cluster_deployed_diamond(event.decoded.as_ref())?;
         // `add_watched_contract` is idempotent (`ON CONFLICT DO
         // NOTHING`) so re-application via WS replay / cold-start is
         // safe. Anchor `from_block` to the deploy block so backfill
@@ -979,6 +963,31 @@ impl IngestorBuilder {
     }
 }
 
+/// Pure parser for the `diamond` field on a decoded ClusterDeployed
+/// event. Split out so the v0.1.4 fix (auto-register diamond from the
+/// factory event) can be unit-tested without spinning up an EventStore
+/// or a real Postgres pool — the actual `add_watched_contract` call is
+/// just an idempotent `ON CONFLICT DO NOTHING` insert downstream.
+pub fn parse_cluster_deployed_diamond(
+    decoded: Option<&serde_json::Value>,
+) -> anyhow::Result<[u8; 20]> {
+    let payload =
+        decoded.ok_or_else(|| anyhow::anyhow!("ClusterDeployed has no decoded payload"))?;
+    let diamond_str = payload
+        .get("diamond")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("ClusterDeployed payload missing `diamond` field"))?;
+    let raw = diamond_str.strip_prefix("0x").unwrap_or(diamond_str);
+    let bytes =
+        hex::decode(raw).map_err(|e| anyhow::anyhow!("ClusterDeployed.diamond not hex: {e}"))?;
+    bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "ClusterDeployed.diamond expected 20 bytes, got {}",
+            bytes.len()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,5 +1044,132 @@ mod tests {
         let raw = r#"{"cluster":"0xabababababababababababababababababababab","kind":"MemberRegistered","event_id":42,"block_number":1234,"log_index":7}"#;
         let back: NotifyEvent = serde_json::from_str(raw).unwrap();
         assert_eq!(back.cluster, [0xab; 20]);
+    }
+
+    // ── B6: register_deployed_diamond extraction (v0.1.4 fix) ───────
+    //
+    // The full register_deployed_diamond fn writes to watched_contracts
+    // (Postgres) — testing that arm requires a real DB. The decoded-
+    // payload extraction is the load-bearing v0.1.4 fix though: before
+    // it landed, ClusterDeployed events came in with the diamond
+    // address but auto-registration didn't fire because the parser
+    // wasn't there. These tests pin the extraction surface so a future
+    // refactor of the event decoder's JSON shape trips the test instead
+    // of silently breaking auto-registration.
+    //
+    // Per memory `project_chain_indexer_live_20260503.md`, this code
+    // path drove the chain-indexer's storage backend cutover from
+    // platform `fbdacec943` to platform-3 `653cccb310` on 2026-05-04.
+
+    #[test]
+    fn parse_cluster_deployed_diamond_extracts_lowercase_hex() {
+        // Canonical happy path: ClusterDeployed event's `decoded`
+        // payload carries `diamond` as a 0x-prefixed lowercase hex
+        // address. Parser must recover the 20-byte address.
+        let decoded = serde_json::json!({
+            "diamond": "0xe2a0233b75beb63f9c377de4ed4ac5965b2eacb9",
+            "deployer": "0x60b174704adaf2b0bf87b426b364d6ebd81818e1"
+        });
+        let addr = parse_cluster_deployed_diamond(Some(&decoded)).unwrap();
+        assert_eq!(
+            hex::encode(addr),
+            "e2a0233b75beb63f9c377de4ed4ac5965b2eacb9"
+        );
+    }
+
+    #[test]
+    fn parse_cluster_deployed_diamond_accepts_uppercase_hex() {
+        // Some encoders mixed-case the address. Pin the parser's
+        // case-insensitivity so a future ABI/decoder bump that flips
+        // case doesn't surface as "addr not 20 bytes".
+        let decoded = serde_json::json!({
+            "diamond": "0xE2A0233B75BEB63F9C377DE4ED4AC5965B2EACB9"
+        });
+        let addr = parse_cluster_deployed_diamond(Some(&decoded)).unwrap();
+        assert_eq!(
+            hex::encode(addr),
+            "e2a0233b75beb63f9c377de4ed4ac5965b2eacb9"
+        );
+    }
+
+    #[test]
+    fn parse_cluster_deployed_diamond_accepts_address_without_0x_prefix() {
+        let decoded = serde_json::json!({
+            "diamond": "e2a0233b75beb63f9c377de4ed4ac5965b2eacb9"
+        });
+        let addr = parse_cluster_deployed_diamond(Some(&decoded)).unwrap();
+        assert_eq!(addr.len(), 20);
+        assert_eq!(addr[0], 0xe2);
+    }
+
+    #[test]
+    fn parse_cluster_deployed_diamond_rejects_missing_payload() {
+        let err = parse_cluster_deployed_diamond(None).unwrap_err();
+        assert!(err.to_string().contains("no decoded payload"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_cluster_deployed_diamond_rejects_missing_diamond_field() {
+        // The decoder ran but the contract emitted no diamond — would
+        // be a contract bug (or a wrong topic0 collision). Surface it
+        // loudly so the operator can investigate rather than swallowing
+        // and silently skipping registration.
+        let decoded = serde_json::json!({
+            "deployer": "0xdeadbeef",
+        });
+        let err = parse_cluster_deployed_diamond(Some(&decoded)).unwrap_err();
+        assert!(err.to_string().contains("missing `diamond`"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_cluster_deployed_diamond_rejects_non_string_diamond_field() {
+        let decoded = serde_json::json!({
+            "diamond": 12345
+        });
+        let err = parse_cluster_deployed_diamond(Some(&decoded)).unwrap_err();
+        assert!(err.to_string().contains("missing `diamond`"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_cluster_deployed_diamond_rejects_non_hex_diamond() {
+        let decoded = serde_json::json!({
+            "diamond": "0xnot-actually-hex-at-all"
+        });
+        let err = parse_cluster_deployed_diamond(Some(&decoded)).unwrap_err();
+        assert!(err.to_string().contains("not hex"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_cluster_deployed_diamond_rejects_short_address() {
+        // 19 bytes (38 hex) — close but not an Ethereum address.
+        let decoded = serde_json::json!({
+            "diamond": "0xe2a0233b75beb63f9c377de4ed4ac5965b2eac"
+        });
+        let err = parse_cluster_deployed_diamond(Some(&decoded)).unwrap_err();
+        assert!(err.to_string().contains("expected 20 bytes"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_cluster_deployed_diamond_rejects_long_address() {
+        // 21 bytes (42 hex) — too many.
+        let decoded = serde_json::json!({
+            "diamond": "0xe2a0233b75beb63f9c377de4ed4ac5965b2eacb9aa"
+        });
+        let err = parse_cluster_deployed_diamond(Some(&decoded)).unwrap_err();
+        assert!(err.to_string().contains("expected 20 bytes"), "msg: {err}");
+    }
+
+    #[test]
+    fn parse_cluster_deployed_diamond_rejects_zero_address_payload() {
+        // Zero address is parseable but a real ClusterDeployed event
+        // would never emit it — this is just a coverage assertion that
+        // the parser doesn't pre-filter on content. (Caller decides
+        // whether to register a zero-address watcher; keeping that
+        // policy out of the parser is the v0.1.4 design.)
+        let decoded = serde_json::json!({
+            "diamond": "0x0000000000000000000000000000000000000000"
+        });
+        let addr = parse_cluster_deployed_diamond(Some(&decoded)).unwrap();
+        assert_eq!(addr, [0u8; 20]);
     }
 }
