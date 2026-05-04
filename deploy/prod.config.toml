@@ -32,21 +32,19 @@ from_block = 45481400
 # sqlx-ra-tls dialer follows
 # `_teesql-leader.<cluster_uuid>.teesql.com` to the current primary;
 # if the storage backend is redeployed under a fresh UUID this value
-# has to move with it. Currently the platform cluster
-# (`fbdacec943`) post-2026-05-03 burndown.
-cluster_uuid    = "fbdacec943"
+# has to move with it. Currently the platform-3 cluster
+# (`653cccb310`) post-2026-05-04 burn-rebuild (replaced platform
+# `fbdacec943` which was wedged on Phala-cloud KMS bug for sidecar
+# upgrades; intermediate platform-2 `5a0c60b41f` was destroyed mid-
+# flight due to a CLI FQDN regression in `KNOWN_NODE_HOSTNAMES` that
+# left publicEndpoint unresolvable).
+cluster_uuid    = "653cccb310"
 database        = "chain_indexer"
 username        = "chain_indexer_writer"
 max_connections = 16
-# Pinned dns-controller manifest-signer for the platform cluster's
-# `_teesql-leader.fbdacec943.teesql.com` TXT record. Captured from
-# the dns-controller's boot log
-# (`signing key ready signer_address=0x…`). Required when neither
-# `TEESQL_INDEXER_TARGET_HOST` nor `TEESQL_INDEXER_TARGET_PORT` is
-# set in the encrypted env (the steady-state default — manifest TXT
-# discovery follows the current leader without operator intervention).
-# Override with TEESQL_INDEXER_TARGET_HOST during initial bring-up
-# when the dns-controller hasn't published the manifest yet.
+# Pinned dns-controller manifest-signer. dns-controller's app_id is
+# unchanged across the burn-rebuild, so the KMS-derived signing key
+# (and address) carries over from the old platform cluster.
 manifest_signer_address = "0xe5ef39a2a1ad344c6d15cfb932e5279a4fb88633"
 
 [server]
