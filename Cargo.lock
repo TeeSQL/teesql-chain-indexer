@@ -5269,7 +5269,7 @@ dependencies = [
 
 [[package]]
 name = "sqlx-ra-tls"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6913,6 +6913,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry 0.8.1",
+ "ring",
  "rusticata-macros",
  "thiserror 2.0.18",
  "time",

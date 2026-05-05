@@ -37,6 +37,35 @@ pub fn uint256_to_json(u: &U256) -> Value {
     Value::String(u.to_string())
 }
 
+/// `uint64` → JSON string of the decimal value. Encoded as a string
+/// for the same reason as `uint256_to_json`: `uint64::MAX = 2^64 - 1`
+/// is past f64's 2^53 lossless range, so serializing through a JSON
+/// number would silently round on extreme values. Operationally
+/// nonces and timestamps stay well below 2^53, but keeping the wire
+/// shape consistent across all uintN avoids special-casing on the
+/// consumer side.
+pub fn uint64_to_json(u: u64) -> Value {
+    Value::String(u.to_string())
+}
+
+/// `uint8` → JSON number. `uint8` fits trivially in f64 (max 255), so
+/// emitting a number rather than a string is both safe and the more
+/// natural shape for downstream JSON consumers (e.g. status codes
+/// like `1=ACCEPTED`, `3=COMPLETED`). Spec §5.3 uses uint8 for the
+/// `status` enum on `ControlAck`.
+pub fn uint8_to_json(u: u8) -> Value {
+    Value::Number(serde_json::Number::from(u))
+}
+
+/// `bytes32[]` → JSON array of `"0x"` + 64-hex-char strings. Used by
+/// `ControlInstructionBroadcast.targetMembers` (spec §5.3) where the
+/// array is non-indexed (an indexed dynamic-array topic only hashes
+/// the array head, defeating per-member filtering). Empty array
+/// preserves "broadcast to all" semantics — see spec §5.6.
+pub fn bytes32_array_to_json(items: &[FixedBytes<32>]) -> Value {
+    Value::Array(items.iter().map(bytes32_to_json).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +118,58 @@ mod tests {
         assert_eq!(
             uint256_to_json(&u).as_str().unwrap(),
             "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+    }
+
+    #[test]
+    fn uint64_serializes_as_decimal_string() {
+        assert_eq!(uint64_to_json(0).as_str().unwrap(), "0");
+        assert_eq!(uint64_to_json(42).as_str().unwrap(), "42");
+        assert_eq!(
+            uint64_to_json(u64::MAX).as_str().unwrap(),
+            "18446744073709551615"
+        );
+    }
+
+    #[test]
+    fn uint8_serializes_as_json_number() {
+        // Status codes from spec §5.3 — 1=ACCEPTED through 6=EXPIRED.
+        let v = uint8_to_json(1);
+        assert_eq!(v.as_u64(), Some(1));
+        let v = uint8_to_json(6);
+        assert_eq!(v.as_u64(), Some(6));
+        // Boundary: u8::MAX still fits.
+        let v = uint8_to_json(255);
+        assert_eq!(v.as_u64(), Some(255));
+    }
+
+    #[test]
+    fn bytes32_array_empty_serializes_as_empty_array() {
+        // `targetMembers = []` is the wire shape for "broadcast to
+        // all members" per spec §5.6. Pin the empty array keeping
+        // its array shape (not null, not omitted) so consumers can
+        // pattern-match without a presence check.
+        let v = bytes32_array_to_json(&[]);
+        assert!(v.is_array());
+        assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn bytes32_array_serializes_each_element_as_hex_string() {
+        let items = vec![
+            FixedBytes::<32>::from([0xaa; 32]),
+            FixedBytes::<32>::from([0x55; 32]),
+        ];
+        let v = bytes32_array_to_json(&items);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(
+            arr[0].as_str().unwrap(),
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            arr[1].as_str().unwrap(),
+            "0x5555555555555555555555555555555555555555555555555555555555555555"
         );
     }
 }

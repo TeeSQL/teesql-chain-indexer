@@ -12,7 +12,8 @@ pub mod factory;
 pub use teesql_chain_indexer_core::decode::Decoder;
 
 use cluster_diamond::{
-    ClusterDestroyedDecoder, LeaderClaimedDecoder, MemberRegisteredDecoder, MemberRetiredDecoder,
+    ClusterDestroyedDecoder, ControlAckDecoder, ControlInstructionBroadcastDecoder,
+    LeaderClaimedDecoder, MemberRegisteredDecoder, MemberRetiredDecoder,
     PublicEndpointUpdatedDecoder,
 };
 use factory::ClusterDeployedDecoder;
@@ -33,6 +34,8 @@ pub fn all_decoders() -> Vec<Box<dyn Decoder>> {
         Box::new(PublicEndpointUpdatedDecoder),
         Box::new(MemberRetiredDecoder),
         Box::new(ClusterDestroyedDecoder),
+        Box::new(ControlInstructionBroadcastDecoder),
+        Box::new(ControlAckDecoder),
     ]
 }
 
@@ -59,7 +62,29 @@ mod tests {
 
     #[test]
     fn all_decoders_count_matches_spec() {
-        // 1 factory event + 5 cluster-diamond events = 6 decoders.
-        assert_eq!(all_decoders().len(), 6);
+        // 1 factory event + 5 lifecycle/membership cluster-diamond
+        // events + 2 control-plane events = 8 decoders.
+        // Track A4 added the control-plane pair
+        // (ControlInstructionBroadcast, ControlAck) — ABI bindings
+        // mirror crates/common/src/cluster_app.rs in the parent
+        // monorepo.
+        assert_eq!(all_decoders().len(), 8);
+    }
+
+    /// Pin the control-plane decoders' presence in `all_decoders()`
+    /// by `kind()` so a future re-shuffle of the vec layout (or a
+    /// regression that drops a `Box::new`) trips this test instead
+    /// of silently leaving the new tables empty in production.
+    #[test]
+    fn all_decoders_includes_control_plane_pair() {
+        let kinds: Vec<&'static str> = all_decoders().iter().map(|d| d.kind()).collect();
+        assert!(
+            kinds.contains(&"ControlInstructionBroadcast"),
+            "all_decoders() must register ControlInstructionBroadcast: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"ControlAck"),
+            "all_decoders() must register ControlAck: {kinds:?}"
+        );
     }
 }
