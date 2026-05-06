@@ -183,6 +183,115 @@ CREATE TABLE historical_query_cache (
 );
 CREATE INDEX historical_query_cache_lru ON historical_query_cache (cached_at);
 
+-- ---------------------------------------------------------------------------
+-- Control-plane tables (Track A4 — spec docs/specs/control-plane-redesign.md
+-- §5.3, §7). Strongly-typed mirrors of the on-chain
+-- ControlInstructionBroadcast + ControlAck events. Distinct from the generic
+-- `events` row + `chain_indexer_events` channel because:
+--
+--   1. Downstream consumers (per-cluster ControlOrderer in Track D1, hub
+--      audit log + log-fetch worker in Track F1/F2) want indexed columns
+--      (cluster, nonce, jobId, seq) without fishing through a JSONB blob
+--      on every probe.
+--   2. The control-plane SSE stream subscribes to its own LISTEN channel
+--      (`chain_indexer_control`) so consumers don't have to filter every
+--      monitoring-hub heartbeat MemberRegistered event off the bus to
+--      get to the per-cluster control traffic.
+--
+-- Both tables follow the same `removed BOOLEAN` reorg convention as
+-- `events`: on reorg the ingestor flips `removed=true` for everything
+-- past the common ancestor and re-applies surviving rows on replay.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE control_instructions (
+  id              bigserial NOT NULL,
+  cluster         bytea NOT NULL,                 -- 20-byte cluster diamond address (the emitter)
+  instruction_id  bytea NOT NULL,                 -- bytes32 from the indexed topic
+  nonce           bigint NOT NULL,                -- uint64 fits cleanly in bigint
+  target_members  bytea[] NOT NULL,               -- bytes32[] non-indexed; empty = broadcast (spec §5.6)
+  expiry          bigint NOT NULL,                -- uint64 unix seconds
+  salt            bytea NOT NULL,                 -- bytes32
+  ciphertext      bytea NOT NULL,                 -- raw bytes
+  ciphertext_hash bytea NOT NULL,                 -- bytes32 = keccak256(ciphertext)
+  block_number    bigint NOT NULL,
+  log_index       int NOT NULL,
+  tx_hash         bytea NOT NULL,
+  observed_at     timestamptz NOT NULL DEFAULT now(),
+  removed         boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (id)
+);
+
+-- (cluster, nonce) uniqueness — the on-chain bitmap-windowed nonce
+-- check (spec §5.5 step 5) prevents true duplicates, but the indexer
+-- can re-observe the same event on WS replay or a steady-state /
+-- backfill overlap. The ingestor uses `ON CONFLICT (cluster, nonce)
+-- WHERE removed = false DO NOTHING` to make the insert idempotent
+-- without resurrecting reorg-marked rows.
+CREATE UNIQUE INDEX control_instructions_cluster_nonce_idx
+  ON control_instructions (cluster, nonce)
+  WHERE removed = false;
+
+CREATE INDEX control_instructions_block_idx
+  ON control_instructions (cluster, block_number, log_index);
+
+CREATE INDEX control_instructions_instruction_id_idx
+  ON control_instructions (instruction_id);
+
+CREATE TABLE control_acks (
+  id              bigserial NOT NULL,
+  cluster         bytea NOT NULL,
+  instruction_id  bytea NOT NULL,
+  job_id          bytea NOT NULL,
+  member_id       bytea NOT NULL,
+  status          smallint NOT NULL,              -- uint8 enum from spec §5.3 (1=ACCEPTED..6=EXPIRED)
+  seq             bigint NOT NULL,                -- uint64 monotonic per (jobId, memberId)
+  log_pointer     bytea,                          -- bytes32 sha256 of encrypted R2 log; NULL on intermediate ACCEPTED
+  summary         bytea,                          -- variable bytes; NULL when not provided
+  block_number    bigint NOT NULL,
+  log_index       int NOT NULL,
+  tx_hash         bytea NOT NULL,
+  observed_at     timestamptz NOT NULL DEFAULT now(),
+  removed         boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (id)
+);
+
+-- (cluster, job_id, seq) uniqueness — the spec mandates strict
+-- monotonicity per (jobId, memberId), which the on-chain facet
+-- enforces. Indexer-side dedup uses this index to swallow WS replays
+-- of the same ack idempotently.
+CREATE UNIQUE INDEX control_acks_cluster_jobid_seq_idx
+  ON control_acks (cluster, job_id, seq)
+  WHERE removed = false;
+
+CREATE INDEX control_acks_instruction_idx
+  ON control_acks (cluster, instruction_id);
+
+CREATE INDEX control_acks_member_idx
+  ON control_acks (cluster, member_id, seq);
+
+CREATE INDEX control_acks_block_idx
+  ON control_acks (cluster, block_number, log_index);
+
+-- ---------------------------------------------------------------------------
+-- LISTEN channel: chain_indexer_control
+--
+-- Mirror of the existing `chain_indexer_events` fan-out (see
+-- `crates/core/src/store.rs::notify` and
+-- `crates/server/src/sse.rs::spawn_listen_worker`) but scoped to
+-- control-plane events. The ingestor writes the row to
+-- `control_instructions` / `control_acks` first, then fires a
+-- `pg_notify` on this channel so downstream subscribers (the SSE
+-- handler in Track D3, the hub log-fetch worker in Track F2) wake up
+-- without polling. Payload shape mirrors the generic NotifyEvent —
+-- a small JSON object the consumer rehydrates back into a typed row.
+-- The full row stays in Postgres so the 8000-byte NOTIFY safe-limit
+-- is never a concern.
+--
+-- The channel is created implicitly by the first NOTIFY; nothing to
+-- declare here. Documented in this provision script so operators
+-- searching for the channel name find it alongside the schema.
+-- ---------------------------------------------------------------------------
+
 -- Sequence access for chain_indexer_reader. Earlier revisions wrote
 -- `IN SCHEMA chain_indexer`, which silently broke the script — no
 -- `chain_indexer` schema exists; tables live in `public`. The

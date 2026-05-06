@@ -218,6 +218,168 @@ impl EventStore {
         Ok(())
     }
 
+    /// Fire `pg_notify('chain_indexer_control', payload)`. Track A4.
+    /// Twin of `notify` for the control-plane fan-out — the per-cluster
+    /// `ControlOrderer` (Track D1) + hub log-fetch worker (Track F2)
+    /// `LISTEN` on this channel. Same 8000-byte safe-limit guard as
+    /// the generic events channel.
+    pub async fn notify_control(&self, payload: &JsonValue) -> anyhow::Result<()> {
+        let payload_str = serde_json::to_string(payload)?;
+        if payload_str.len() > 7900 {
+            anyhow::bail!(
+                "notify_control payload {} bytes exceeds Postgres NOTIFY safe limit",
+                payload_str.len()
+            );
+        }
+        sqlx::query("SELECT pg_notify('chain_indexer_control', $1)")
+            .bind(payload_str)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Insert a `ControlInstructionBroadcast` row. Returns the assigned
+    /// `id` on first write, `None` when the unique
+    /// `(cluster, nonce) WHERE removed=false` index swallows the
+    /// duplicate (idempotent under WS replay / cold-start overlap).
+    /// Spec §5.3.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_control_instruction(
+        &self,
+        cluster: [u8; 20],
+        instruction_id: [u8; 32],
+        nonce: u64,
+        target_members: &[[u8; 32]],
+        expiry: u64,
+        salt: [u8; 32],
+        ciphertext: &[u8],
+        ciphertext_hash: [u8; 32],
+        block_number: u64,
+        log_index: i32,
+        tx_hash: [u8; 32],
+    ) -> anyhow::Result<Option<i64>> {
+        let nonce_i64 =
+            i64::try_from(nonce).map_err(|_| anyhow::anyhow!("nonce {nonce} overflows i64"))?;
+        let expiry_i64 =
+            i64::try_from(expiry).map_err(|_| anyhow::anyhow!("expiry {expiry} overflows i64"))?;
+        let block_number_i64 = i64::try_from(block_number)
+            .map_err(|_| anyhow::anyhow!("block_number {block_number} overflows i64"))?;
+
+        // bytea[] passes through sqlx as `Vec<Vec<u8>>`. Materialise
+        // the heap array once so the bind site doesn't capture a slice
+        // reference into a temporary. Empty array = "broadcast to all
+        // members" per spec §5.6 — preserve the empty shape rather
+        // than coercing to NULL.
+        let target_members_owned: Vec<Vec<u8>> =
+            target_members.iter().map(|m| m.to_vec()).collect();
+
+        let id: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO control_instructions (\
+                 cluster, instruction_id, nonce, target_members, \
+                 expiry, salt, ciphertext, ciphertext_hash, \
+                 block_number, log_index, tx_hash\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (cluster, nonce) WHERE removed = false DO NOTHING \
+             RETURNING id",
+        )
+        .bind(&cluster[..])
+        .bind(&instruction_id[..])
+        .bind(nonce_i64)
+        .bind(target_members_owned)
+        .bind(expiry_i64)
+        .bind(&salt[..])
+        .bind(ciphertext)
+        .bind(&ciphertext_hash[..])
+        .bind(block_number_i64)
+        .bind(log_index)
+        .bind(&tx_hash[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Insert a `ControlAck` row. Returns the assigned `id` on first
+    /// write, `None` when the unique `(cluster, job_id, seq) WHERE
+    /// removed=false` index swallows the duplicate. Spec §5.3 / §8.1.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_control_ack(
+        &self,
+        cluster: [u8; 20],
+        instruction_id: [u8; 32],
+        job_id: [u8; 32],
+        member_id: [u8; 32],
+        status: u8,
+        seq: u64,
+        log_pointer: Option<[u8; 32]>,
+        summary: Option<&[u8]>,
+        block_number: u64,
+        log_index: i32,
+        tx_hash: [u8; 32],
+    ) -> anyhow::Result<Option<i64>> {
+        let seq_i64 = i64::try_from(seq).map_err(|_| anyhow::anyhow!("seq {seq} overflows i64"))?;
+        let block_number_i64 = i64::try_from(block_number)
+            .map_err(|_| anyhow::anyhow!("block_number {block_number} overflows i64"))?;
+        let log_pointer_bytes: Option<&[u8]> = log_pointer.as_ref().map(|p| &p[..]);
+
+        let id: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO control_acks (\
+                 cluster, instruction_id, job_id, member_id, status, \
+                 seq, log_pointer, summary, block_number, log_index, \
+                 tx_hash\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (cluster, job_id, seq) WHERE removed = false DO NOTHING \
+             RETURNING id",
+        )
+        .bind(&cluster[..])
+        .bind(&instruction_id[..])
+        .bind(&job_id[..])
+        .bind(&member_id[..])
+        .bind(i16::from(status))
+        .bind(seq_i64)
+        .bind(log_pointer_bytes)
+        .bind(summary)
+        .bind(block_number_i64)
+        .bind(log_index)
+        .bind(&tx_hash[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Mark every control-plane row past the common ancestor as
+    /// `removed = true`. Mirrors the per-event `mark_removed_after`
+    /// path so the reorg handler in `Ingestor::handle_reorg` can
+    /// roll back instructions + acks alongside the generic events
+    /// table without leaving stale control rows visible.
+    pub async fn mark_control_removed_after(
+        &self,
+        common_ancestor_block: u64,
+    ) -> anyhow::Result<u64> {
+        let n_i64 = i64::try_from(common_ancestor_block)
+            .map_err(|_| anyhow::anyhow!("block {common_ancestor_block} overflows i64"))?;
+        // Two updates rather than a CTE so each table's row count is
+        // visible in tracing for debugging stuck reorg replays. The
+        // queries are cheap (small index range scan over recent
+        // blocks) so the round-trip cost is negligible.
+        let instr = sqlx::query(
+            "UPDATE control_instructions \
+             SET removed = true \
+             WHERE block_number > $1 AND removed = false",
+        )
+        .bind(n_i64)
+        .execute(&self.pool)
+        .await?;
+        let acks = sqlx::query(
+            "UPDATE control_acks \
+             SET removed = true \
+             WHERE block_number > $1 AND removed = false",
+        )
+        .bind(n_i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(instr.rows_affected() + acks.rows_affected())
+    }
+
     /// Read the per-contract cursor. Returns 0 when absent so the
     /// caller can treat first-time contracts uniformly.
     ///

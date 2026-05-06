@@ -120,6 +120,33 @@ fn deserialize_cluster_hex<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8
     Ok(out)
 }
 
+/// Wire shape for the `chain_indexer_control` LISTEN channel — Track
+/// A4. Mirrors `NotifyEvent`'s string-encoded `cluster` discipline so
+/// the consumer-side LISTEN worker (Track D3 SSE handler) can
+/// deserialize directly without an intermediate shape that drifts.
+///
+/// `kind` is one of `"ControlInstructionBroadcast"` | `"ControlAck"`.
+/// `row_id` is the bigserial PK assigned to either the
+/// `control_instructions` or `control_acks` row — the consumer uses
+/// it for ordered backlog reads exactly like `event_id` does on the
+/// generic events bus. `event_id` rides alongside as the
+/// generic-table row id so the consumer can correlate to the raw
+/// `events` row when needed (e.g. for tx-hash provenance assertions
+/// during reorg replay verification).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ControlNotifyEvent {
+    #[serde(
+        serialize_with = "serialize_cluster_hex",
+        deserialize_with = "deserialize_cluster_hex"
+    )]
+    pub cluster: [u8; 20],
+    pub kind: String,
+    pub row_id: i64,
+    pub event_id: i64,
+    pub block_number: u64,
+    pub log_index: i32,
+}
+
 /// Long-running ingest engine. One per chain.
 ///
 /// Construct via [`Ingestor::builder`] — direct construction would
@@ -671,11 +698,23 @@ impl Ingestor {
             .mark_removed_after(common)
             .await
             .map_err(IngestError::Transient)?;
+        // Track A4: control-plane rows live in dedicated tables and
+        // are not covered by `mark_removed_after` (which only flips
+        // `events`). Roll them back alongside the generic events so
+        // the per-cluster ControlOrderer (Track D1) doesn't see
+        // dispatched-then-orphaned instructions/acks past the
+        // common ancestor.
+        let removed_control = self
+            .store
+            .mark_control_removed_after(common)
+            .await
+            .map_err(IngestError::Transient)?;
         tracing::warn!(
             chain_id = self.chain_id,
             common_ancestor = common,
             head,
             removed_events = removed,
+            removed_control = removed_control,
             "reorg rollback applied; replaying views forward"
         );
 
@@ -763,6 +802,48 @@ impl Ingestor {
             }
         }
 
+        // Track A4: control-plane events go to dedicated tables in
+        // addition to the generic `events` row, and fan out on the
+        // separate `chain_indexer_control` channel. The per-cluster
+        // ControlOrderer (Track D1) consumes that channel; keeping
+        // control traffic off the generic events bus avoids forcing
+        // every existing SSE subscriber to filter the new high-rate
+        // (per-instruction × per-member) ack volume out of their feed.
+        //
+        // Failures here log and move on by design — the row is
+        // already in `events` so a future replay (WS reconnect,
+        // operator-driven `eth_getLogs` re-pull) re-runs this branch
+        // idempotently against the unique
+        // `(cluster, nonce|job_id, seq) WHERE removed=false` indexes.
+        match event.kind.as_deref() {
+            Some("ControlInstructionBroadcast") => {
+                if let Err(e) = self
+                    .insert_control_instruction_from_event(&event, event_id)
+                    .await
+                {
+                    tracing::warn!(
+                        chain_id = self.chain_id,
+                        block = event.block_number,
+                        log_index = event.log_index,
+                        error = %e,
+                        "ControlInstructionBroadcast insert/notify failed; retry on next replay"
+                    );
+                }
+            }
+            Some("ControlAck") => {
+                if let Err(e) = self.insert_control_ack_from_event(&event, event_id).await {
+                    tracing::warn!(
+                        chain_id = self.chain_id,
+                        block = event.block_number,
+                        log_index = event.log_index,
+                        error = %e,
+                        "ControlAck insert/notify failed; retry on next replay"
+                    );
+                }
+            }
+            _ => {}
+        }
+
         let kind = event.kind.clone().unwrap_or_else(|| "unknown".to_string());
         let payload = NotifyEvent {
             cluster: event.contract,
@@ -785,6 +866,154 @@ impl Ingestor {
             }
         }
 
+        Ok(())
+    }
+
+    /// Insert a `ControlInstructionBroadcast` row into the dedicated
+    /// `control_instructions` table and fire the
+    /// `chain_indexer_control` notification. Decodes the typed fields
+    /// out of the generic `event.decoded` JSON the
+    /// [`crate::decode::Decoder`] produced — the JSON shape is set in
+    /// `teesql-abi::cluster_diamond::ControlInstructionBroadcastDecoder`
+    /// (Track A4). Idempotent: the unique
+    /// `(cluster, nonce) WHERE removed=false` index swallows replays.
+    /// Spec docs/specs/control-plane-redesign.md §5.3.
+    async fn insert_control_instruction_from_event(
+        &self,
+        event: &DecodedEvent,
+        event_id: i64,
+    ) -> anyhow::Result<()> {
+        let payload = event.decoded.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("ControlInstructionBroadcast event has no decoded payload")
+        })?;
+
+        let instruction_id = parse_bytes32_field(payload, "instructionId")?;
+        // clusterId on the event is the bytes32 cluster discriminator
+        // pinned by the EIP-712 envelope; we store the emitter address
+        // (event.contract) as the row's `cluster` column so consumers
+        // join against `watched_contracts.address` without indirection.
+        // The on-chain `clusterId` lives in the raw events row's
+        // decoded JSON for callers who need both.
+        let nonce = parse_uint64_string_field(payload, "nonce")?;
+        let target_members = parse_bytes32_array_field(payload, "targetMembers")?;
+        let expiry = parse_uint64_string_field(payload, "expiry")?;
+        let salt = parse_bytes32_field(payload, "salt")?;
+        let ciphertext = parse_bytes_field(payload, "ciphertext")?;
+        let ciphertext_hash = parse_bytes32_field(payload, "ciphertextHash")?;
+
+        let inserted = self
+            .store
+            .insert_control_instruction(
+                event.contract,
+                instruction_id,
+                nonce,
+                &target_members,
+                expiry,
+                salt,
+                &ciphertext,
+                ciphertext_hash,
+                event.block_number,
+                event.log_index,
+                event.tx_hash,
+            )
+            .await?;
+
+        let row_id = match inserted {
+            Some(id) => id,
+            None => {
+                // Idempotent re-apply (WS replay, cold-start overlap).
+                // The on-conflict clause skipped the insert; we still
+                // want a notification fired so a downstream consumer
+                // that crashed mid-fetch the first time around picks
+                // up the row on its next reconnect. Look up the
+                // existing row's id so the LISTEN payload carries a
+                // stable cursor.
+                lookup_control_instruction_id(self.store.pool(), event.contract, nonce).await?
+            }
+        };
+
+        let payload = ControlNotifyEvent {
+            cluster: event.contract,
+            kind: "ControlInstructionBroadcast".to_string(),
+            row_id,
+            event_id,
+            block_number: event.block_number,
+            log_index: event.log_index,
+        };
+        let payload_json = serde_json::to_value(&payload)?;
+        self.store.notify_control(&payload_json).await?;
+        Ok(())
+    }
+
+    /// Insert a `ControlAck` row into the dedicated `control_acks`
+    /// table and fire the `chain_indexer_control` notification.
+    /// Mirrors `insert_control_instruction_from_event`. Spec §5.3 +
+    /// §8.1. Idempotent under replay via the unique
+    /// `(cluster, job_id, seq) WHERE removed=false` index.
+    async fn insert_control_ack_from_event(
+        &self,
+        event: &DecodedEvent,
+        event_id: i64,
+    ) -> anyhow::Result<()> {
+        let payload = event
+            .decoded
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ControlAck event has no decoded payload"))?;
+
+        let instruction_id = parse_bytes32_field(payload, "instructionId")?;
+        let job_id = parse_bytes32_field(payload, "jobId")?;
+        let member_id = parse_bytes32_field(payload, "memberId")?;
+        let status = parse_uint8_field(payload, "status")?;
+        let seq = parse_uint64_string_field(payload, "seq")?;
+        // logPointer is bytes32 zero on intermediate ACCEPTED acks
+        // (spec §8.1 — terminal acks carry the sha256). Treat the
+        // all-zero value as "not set" so a downstream NULL check
+        // doesn't have to special-case it.
+        let log_pointer_raw = parse_bytes32_field(payload, "logPointer")?;
+        let log_pointer = if log_pointer_raw == [0u8; 32] {
+            None
+        } else {
+            Some(log_pointer_raw)
+        };
+        let summary = parse_bytes_field(payload, "summary")?;
+        let summary_opt: Option<&[u8]> = if summary.is_empty() {
+            None
+        } else {
+            Some(summary.as_slice())
+        };
+
+        let inserted = self
+            .store
+            .insert_control_ack(
+                event.contract,
+                instruction_id,
+                job_id,
+                member_id,
+                status,
+                seq,
+                log_pointer,
+                summary_opt,
+                event.block_number,
+                event.log_index,
+                event.tx_hash,
+            )
+            .await?;
+
+        let row_id = match inserted {
+            Some(id) => id,
+            None => lookup_control_ack_id(self.store.pool(), event.contract, job_id, seq).await?,
+        };
+
+        let payload = ControlNotifyEvent {
+            cluster: event.contract,
+            kind: "ControlAck".to_string(),
+            row_id,
+            event_id,
+            block_number: event.block_number,
+            log_index: event.log_index,
+        };
+        let payload_json = serde_json::to_value(&payload)?;
+        self.store.notify_control(&payload_json).await?;
         Ok(())
     }
 
@@ -988,6 +1217,147 @@ pub fn parse_cluster_deployed_diamond(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Field parsers for control-plane events. The decoded JSON shape is
+// produced by `teesql-abi::cluster_diamond` (Track A4 decoders); the
+// parsers below are kept pure (operate on `&serde_json::Value`) so
+// unit tests can exercise every error branch without a Postgres
+// pool. The corresponding insert paths in `Ingestor` are thin shims
+// that route the parsed values to `EventStore::insert_control_*`.
+// ---------------------------------------------------------------------------
+
+/// `0x`-prefixed 64-hex-char string → `[u8; 32]`. Used for
+/// `instructionId`, `clusterId`, `salt`, `ciphertextHash`, `jobId`,
+/// `memberId`, `logPointer` — every bytes32 field on the control
+/// events. Accepts mixed-case + missing-prefix shapes for parity
+/// with `parse_cluster_deployed_diamond`'s flexibility.
+pub fn parse_bytes32_field(payload: &serde_json::Value, field: &str) -> anyhow::Result<[u8; 32]> {
+    let s = payload
+        .get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("payload missing `{field}` (expected hex string)"))?;
+    let raw = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(raw).map_err(|e| anyhow::anyhow!("`{field}` not hex: {e}"))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("`{field}` expected 32 bytes, got {}", bytes.len()))
+}
+
+/// Variable-length `bytes` field (`ciphertext`, `summary`) → owned
+/// `Vec<u8>`. Empty `"0x"` returns an empty vec rather than failing;
+/// the spec allows `summary` to be empty on intermediate acks.
+pub fn parse_bytes_field(payload: &serde_json::Value, field: &str) -> anyhow::Result<Vec<u8>> {
+    let s = payload
+        .get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("payload missing `{field}` (expected hex string)"))?;
+    let raw = s.strip_prefix("0x").unwrap_or(s);
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    hex::decode(raw).map_err(|e| anyhow::anyhow!("`{field}` not hex: {e}"))
+}
+
+/// `uint64`-as-decimal-string → `u64`. Mirrors the
+/// `uint64_to_json` encoder convention (decimal string for parity
+/// with `uint256`). Rejects negative or non-decimal shapes loudly
+/// so a future encoder drift surfaces here rather than silently
+/// truncating in `i64::try_from`.
+pub fn parse_uint64_string_field(payload: &serde_json::Value, field: &str) -> anyhow::Result<u64> {
+    let s = payload
+        .get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("payload missing `{field}` (expected decimal string)"))?;
+    s.parse::<u64>()
+        .map_err(|e| anyhow::anyhow!("`{field}` not a u64 decimal: {e}"))
+}
+
+/// `uint8` → `u8`. Status enums fit in JSON Number land (max 255 is
+/// well inside f64), but we still bound-check defensively because
+/// a non-control payload reaching this parser would be a regression
+/// in the dispatch above.
+pub fn parse_uint8_field(payload: &serde_json::Value, field: &str) -> anyhow::Result<u8> {
+    let v = payload
+        .get(field)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("payload missing `{field}` (expected JSON number)"))?;
+    u8::try_from(v).map_err(|_| anyhow::anyhow!("`{field}` value {v} out of u8 range"))
+}
+
+/// `bytes32[]` → owned `Vec<[u8; 32]>`. Used for
+/// `ControlInstructionBroadcast.targetMembers`. Empty array =
+/// "broadcast to all" per spec §5.6; an empty input still returns
+/// `Ok(vec![])` so the caller doesn't have to special-case the wire
+/// shape at the boundary.
+pub fn parse_bytes32_array_field(
+    payload: &serde_json::Value,
+    field: &str,
+) -> anyhow::Result<Vec<[u8; 32]>> {
+    let arr = payload
+        .get(field)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("payload missing `{field}` (expected JSON array)"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let s = item
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("`{field}[{i}]` expected hex string, got {item:?}"))?;
+        let raw = s.strip_prefix("0x").unwrap_or(s);
+        let bytes = hex::decode(raw).map_err(|e| anyhow::anyhow!("`{field}[{i}]` not hex: {e}"))?;
+        let arr32: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!("`{field}[{i}]` expected 32 bytes, got {}", bytes.len())
+        })?;
+        out.push(arr32);
+    }
+    Ok(out)
+}
+
+/// Look up an existing `control_instructions.id` for an event we
+/// tried to insert but hit the dedup index (idempotent replay path).
+/// Filters on `removed=false` to match the partial unique index, so
+/// a reorg-rolled-back row never re-surfaces as a "live" id.
+async fn lookup_control_instruction_id(
+    pool: &sqlx::PgPool,
+    cluster: [u8; 20],
+    nonce: u64,
+) -> anyhow::Result<i64> {
+    let nonce_i64 = i64::try_from(nonce)
+        .map_err(|_| anyhow::anyhow!("nonce {nonce} overflows i64 in lookup"))?;
+    let id: i64 = sqlx::query_scalar(
+        "SELECT id FROM control_instructions \
+         WHERE cluster = $1 AND nonce = $2 AND removed = false",
+    )
+    .bind(&cluster[..])
+    .bind(nonce_i64)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("lookup_control_instruction_id: {e}"))?;
+    Ok(id)
+}
+
+/// Look up an existing `control_acks.id` for an idempotent replay.
+async fn lookup_control_ack_id(
+    pool: &sqlx::PgPool,
+    cluster: [u8; 20],
+    job_id: [u8; 32],
+    seq: u64,
+) -> anyhow::Result<i64> {
+    let seq_i64 =
+        i64::try_from(seq).map_err(|_| anyhow::anyhow!("seq {seq} overflows i64 in lookup"))?;
+    let id: i64 = sqlx::query_scalar(
+        "SELECT id FROM control_acks \
+         WHERE cluster = $1 AND job_id = $2 AND seq = $3 AND removed = false",
+    )
+    .bind(&cluster[..])
+    .bind(&job_id[..])
+    .bind(seq_i64)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("lookup_control_ack_id: {e}"))?;
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1171,5 +1541,190 @@ mod tests {
         });
         let addr = parse_cluster_deployed_diamond(Some(&decoded)).unwrap();
         assert_eq!(addr, [0u8; 20]);
+    }
+
+    // ── Track A4: control-plane payload parsers ───────────────────────
+    //
+    // These pin the wire shape produced by `teesql-abi`'s
+    // ControlInstructionBroadcastDecoder + ControlAckDecoder so any
+    // future encoder drift trips here rather than silently leaving
+    // the dedicated control_instructions / control_acks tables empty.
+
+    fn full_broadcast_payload() -> serde_json::Value {
+        // Mirrors the JSON that
+        // `teesql-abi::cluster_diamond::ControlInstructionBroadcastDecoder`
+        // emits — uint64 fields land as decimal strings, bytes32
+        // arrays as 0x-hex strings inside an array.
+        serde_json::json!({
+            "instructionId":  "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "clusterId":      "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "nonce":          "5",
+            "targetMembers":  [
+                "0x3333333333333333333333333333333333333333333333333333333333333333",
+                "0x4444444444444444444444444444444444444444444444444444444444444444",
+            ],
+            "expiry":         "1717592400",
+            "salt":           "0x5555555555555555555555555555555555555555555555555555555555555555",
+            "ciphertextHash": "0x6666666666666666666666666666666666666666666666666666666666666666",
+            "ciphertext":     "0xdeadbeef",
+        })
+    }
+
+    fn full_ack_payload() -> serde_json::Value {
+        serde_json::json!({
+            "instructionId": "0x7777777777777777777777777777777777777777777777777777777777777777",
+            "jobId":         "0x8888888888888888888888888888888888888888888888888888888888888888",
+            "memberId":      "0x9999999999999999999999999999999999999999999999999999999999999999",
+            "status":        3,
+            "seq":           "42",
+            "logPointer":    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "summary":       "0xcafe",
+        })
+    }
+
+    #[test]
+    fn parse_bytes32_field_round_trips_lowercase() {
+        let p = full_broadcast_payload();
+        let id = parse_bytes32_field(&p, "instructionId").unwrap();
+        assert_eq!(id, [0x11; 32]);
+    }
+
+    #[test]
+    fn parse_bytes32_field_accepts_uppercase_and_no_prefix() {
+        let p = serde_json::json!({"x": "AABBCCDDEEFF112233445566778899AABBCCDDEEFF112233445566778899AABB"});
+        // 64 hex chars = 32 bytes; case-insensitive + missing prefix.
+        let v = parse_bytes32_field(&p, "x").unwrap();
+        assert_eq!(v[0], 0xAA);
+        assert_eq!(v[31], 0xBB);
+    }
+
+    #[test]
+    fn parse_bytes32_field_rejects_missing() {
+        let p = serde_json::json!({"y": "0x"});
+        let err = parse_bytes32_field(&p, "x").unwrap_err();
+        assert!(err.to_string().contains("missing `x`"));
+    }
+
+    #[test]
+    fn parse_bytes32_field_rejects_wrong_length() {
+        let p = serde_json::json!({"x": "0x1122"});
+        let err = parse_bytes32_field(&p, "x").unwrap_err();
+        assert!(err.to_string().contains("expected 32 bytes"));
+    }
+
+    #[test]
+    fn parse_uint64_string_field_happy_path() {
+        let p = full_broadcast_payload();
+        assert_eq!(parse_uint64_string_field(&p, "nonce").unwrap(), 5);
+        assert_eq!(
+            parse_uint64_string_field(&p, "expiry").unwrap(),
+            1_717_592_400
+        );
+    }
+
+    #[test]
+    fn parse_uint64_string_field_max_value() {
+        // u64::MAX serialised as decimal string round-trips. Catches a
+        // future regression where someone "optimised" the encoder to
+        // emit a JSON number and silently round-tripped through f64.
+        let p = serde_json::json!({"x": "18446744073709551615"});
+        assert_eq!(parse_uint64_string_field(&p, "x").unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn parse_uint64_string_field_rejects_non_decimal() {
+        let p = serde_json::json!({"x": "0xdead"});
+        let err = parse_uint64_string_field(&p, "x").unwrap_err();
+        assert!(err.to_string().contains("not a u64 decimal"));
+    }
+
+    #[test]
+    fn parse_uint8_field_in_range() {
+        let p = full_ack_payload();
+        assert_eq!(parse_uint8_field(&p, "status").unwrap(), 3);
+    }
+
+    #[test]
+    fn parse_uint8_field_rejects_overflow() {
+        let p = serde_json::json!({"status": 256});
+        let err = parse_uint8_field(&p, "status").unwrap_err();
+        assert!(err.to_string().contains("out of u8 range"));
+    }
+
+    #[test]
+    fn parse_bytes_field_decodes_hex_payload() {
+        let p = full_ack_payload();
+        let summary = parse_bytes_field(&p, "summary").unwrap();
+        assert_eq!(summary, vec![0xca, 0xfe]);
+    }
+
+    #[test]
+    fn parse_bytes_field_empty_zero_x_returns_empty_vec() {
+        // `summary` on intermediate ACCEPTED acks is "0x" — empty
+        // bytes. The parser must NOT error; the caller maps an empty
+        // vec to `NULL` so the column reflects "not set" cleanly.
+        let p = serde_json::json!({"summary": "0x"});
+        let summary = parse_bytes_field(&p, "summary").unwrap();
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn parse_bytes32_array_field_recovers_each_element() {
+        let p = full_broadcast_payload();
+        let v = parse_bytes32_array_field(&p, "targetMembers").unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], [0x33; 32]);
+        assert_eq!(v[1], [0x44; 32]);
+    }
+
+    #[test]
+    fn parse_bytes32_array_field_empty_array_is_broadcast_signal() {
+        // Spec §5.6: `targetMembers = []` means "deliver to all
+        // members." The parser must preserve emptiness rather than
+        // collapsing it into an error.
+        let p = serde_json::json!({"x": []});
+        let v = parse_bytes32_array_field(&p, "x").unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn parse_bytes32_array_field_rejects_non_string_element() {
+        let p = serde_json::json!({"x": [123]});
+        let err = parse_bytes32_array_field(&p, "x").unwrap_err();
+        assert!(err.to_string().contains("expected hex string"));
+    }
+
+    #[test]
+    fn parse_bytes32_array_field_rejects_short_element() {
+        let p = serde_json::json!({"x": ["0x11"]});
+        let err = parse_bytes32_array_field(&p, "x").unwrap_err();
+        assert!(err.to_string().contains("expected 32 bytes"));
+    }
+
+    /// `ControlNotifyEvent` MUST land on the wire with `cluster` as a
+    /// 0x-prefixed hex string — the LISTEN consumer path (Track D3)
+    /// will deserialize directly back into this shape, so the byte-
+    /// array default would silently break round-trip just like it
+    /// did for the generic `NotifyEvent`.
+    #[test]
+    fn control_notify_event_round_trips_cluster_hex() {
+        let n = ControlNotifyEvent {
+            cluster: [0xab; 20],
+            kind: "ControlInstructionBroadcast".into(),
+            row_id: 1,
+            event_id: 99,
+            block_number: 12345,
+            log_index: 2,
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(
+            v.get("cluster").unwrap().as_str().unwrap(),
+            "0xabababababababababababababababababababab"
+        );
+        let raw = r#"{"cluster":"0xabababababababababababababababababababab","kind":"ControlAck","row_id":7,"event_id":42,"block_number":1,"log_index":0}"#;
+        let back: ControlNotifyEvent = serde_json::from_str(raw).unwrap();
+        assert_eq!(back.cluster, [0xab; 20]);
+        assert_eq!(back.kind, "ControlAck");
+        assert_eq!(back.row_id, 7);
     }
 }
