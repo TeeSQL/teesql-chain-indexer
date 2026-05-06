@@ -273,6 +273,44 @@ CREATE INDEX control_acks_block_idx
   ON control_acks (cluster, block_number, log_index);
 
 -- ---------------------------------------------------------------------------
+-- Control-plane hole tracking (Track D2 — spec
+-- docs/specs/control-plane-redesign.md §7.4).
+--
+-- The per-cluster ControlOrderer (Track D1) is strict-ordered: it
+-- dispatches instructions in `nonce` order and stops the cluster's
+-- stream when a gap is observed (buffer expired, MAX_BUFFER_AGE
+-- exceeded, or buffer-bound exhausted with the lowest nonce still
+-- missing). The hole row is the durable record of that stall — emitted
+-- to the control-plane SSE stream as a `hole` frame and surfaced in
+-- the hub UI so the cluster-owner Safe can rebroadcast at the missing
+-- nonce per spec §5.7.
+--
+-- `(cluster, missing_nonce)` is unique so a re-trigger of the same
+-- hole (e.g. the ordering loop re-evaluates after a new event arrives
+-- but the gap persists) is an UPSERT — only the first observation
+-- carries the original `observed_at`, and `resolved_at` is updated on
+-- whichever path closes the hole first (backfill or rebroadcast).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE control_holes (
+  id                bigserial NOT NULL,
+  cluster           bytea NOT NULL,                 -- 20-byte cluster diamond address
+  missing_nonce     bigint NOT NULL,                -- the nonce we're stuck waiting for
+  highest_buffered  bigint NOT NULL,                -- highest nonce currently in the buffer (stuck-on telemetry)
+  reason            text NOT NULL,                  -- 'buffer_expired' | 'buffer_full' | 'manual'
+  observed_at       timestamptz NOT NULL DEFAULT now(),
+  resolved_at       timestamptz,                    -- NULL while the hole is open
+  PRIMARY KEY (id)
+);
+
+CREATE UNIQUE INDEX control_holes_cluster_nonce_idx
+  ON control_holes (cluster, missing_nonce);
+
+CREATE INDEX control_holes_open_idx
+  ON control_holes (cluster, observed_at)
+  WHERE resolved_at IS NULL;
+
+-- ---------------------------------------------------------------------------
 -- LISTEN channel: chain_indexer_control
 --
 -- Mirror of the existing `chain_indexer_events` fan-out (see

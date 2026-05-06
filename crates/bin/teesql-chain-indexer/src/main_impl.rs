@@ -30,12 +30,14 @@ use tokio::sync::{broadcast, mpsc};
 
 use teesql_chain_indexer_attest::{AttestConfig, Signer};
 use teesql_chain_indexer_core::connection::{build_pool, ConnectionConfig};
-use teesql_chain_indexer_core::ingest::NotifyEvent;
+use teesql_chain_indexer_core::ingest::{ControlNotifyEvent, NotifyEvent};
 use teesql_chain_indexer_core::store::EventStore;
 use teesql_chain_indexer_core::Ingestor;
 use teesql_chain_indexer_server::metrics::Metrics;
 use teesql_chain_indexer_server::state::{AppState, MultiChainState, ServerConfig};
-use teesql_chain_indexer_server::{build_grpc_service, build_router, spawn_listen_worker};
+use teesql_chain_indexer_server::{
+    build_grpc_service, build_router, spawn_control_listen_worker, spawn_listen_worker,
+};
 
 use crate::config::{ChainConfig, Config};
 use crate::manifest_resolver::{host_port_from_leader_url, resolve_leader_manifest};
@@ -152,11 +154,24 @@ pub async fn run() -> Result<()> {
         // covers the 1k SSE connection cap with headroom.
         let (sse_tx, _sse_rx) = broadcast::channel::<NotifyEvent>(2048);
 
+        // Track D3: separate control-plane bus. Sized smaller than
+        // the generic events bus because each cluster has at most a
+        // handful of control SSE subscribers (one per member sidecar
+        // + one for the hub UI), and the per-cluster ControlOrderer
+        // strictly serializes by `nonce` so backed-up frames are not
+        // a real failure mode the way they would be on the generic
+        // events bus. 512 covers a worst-case lag spike without
+        // forcing reconnects.
+        let (control_tx, _control_rx) = broadcast::channel::<ControlNotifyEvent>(512);
+
         // Postgres LISTEN→broadcast bridge for the route layer's SSE
         // path. Keeps SSE alive when the in-process notify path is
         // bypassed (e.g. a future multi-instance HA topology where
         // the writer + reader live in different processes).
         let _listen_handle = spawn_listen_worker(pool.clone(), sse_tx.clone());
+        // Twin bridge for the dedicated `chain_indexer_control`
+        // channel. Track D3.
+        let _control_listen_handle = spawn_control_listen_worker(pool.clone(), control_tx.clone());
 
         // In-process Ingestor → broadcast bridge. The Ingestor sends a
         // `NotifyEvent` on this mpsc after every event apply alongside
@@ -189,6 +204,7 @@ pub async fn run() -> Result<()> {
             signer: signer.clone(),
             views: views_arc.clone(),
             sse_tx: sse_tx.clone(),
+            control_tx: control_tx.clone(),
             config: ServerConfig {
                 sse_max_connections: cfg.server.sse_max_connections as usize,
                 rate_limit_rps: cfg.server.rate_limit_rps,

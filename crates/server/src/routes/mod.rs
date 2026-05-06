@@ -43,6 +43,7 @@ pub mod attestation;
 pub mod chains;
 pub mod clusters;
 pub mod common;
+pub mod control;
 pub mod events;
 pub mod factories;
 pub mod health;
@@ -103,6 +104,18 @@ pub fn router(state: Arc<MultiChainState>, metrics: Arc<Metrics>) -> Router {
         // fan-out and follows up with this signed-envelope lookup
         // when it needs cryptographic proof of a specific event id.
         .route("/:chain/events/:id", get(events::get_event_by_id))
+        // Track D3 — per-cluster control-plane SSE stream with
+        // strict-ordered fan-out + member auth. The companion
+        // `/control/challenge` issues a fresh nonce so subscribers
+        // can sign offline before opening the stream. Spec §7.
+        .route(
+            "/:chain/clusters/:addr/control/challenge",
+            get(control::issue_challenge),
+        )
+        .route(
+            "/:chain/clusters/:addr/control/sse",
+            get(control::control_sse_handler),
+        )
         .with_state(state.clone());
 
     let metrics_router = Router::new()
