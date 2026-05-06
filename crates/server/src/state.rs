@@ -18,7 +18,11 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 
 use teesql_chain_indexer_attest::Signer;
-use teesql_chain_indexer_core::{ingest::NotifyEvent, store::EventStore, views::View};
+use teesql_chain_indexer_core::{
+    ingest::{ControlNotifyEvent, NotifyEvent},
+    store::EventStore,
+    views::View,
+};
 
 /// Per-server runtime configuration. Kept separate from the
 /// chain-indexer's binary-level `Config` so the server crate stays
@@ -71,6 +75,16 @@ pub struct AppState {
     /// `core::Ingestor`'s mpsc, (b) the Postgres LISTEN worker. See
     /// `crate::sse::spawn_listen_worker`.
     pub sse_tx: broadcast::Sender<NotifyEvent>,
+
+    /// Track D3 — separate broadcast channel for control-plane events
+    /// (`ControlNotifyEvent`). Carries
+    /// `chain_indexer_control` LISTEN payloads onto a dedicated bus
+    /// the per-cluster `control_sse_handler` subscribes to. Kept off
+    /// the generic `sse_tx` so existing `/events/sse` consumers don't
+    /// have to filter the high-rate (per-instruction × per-member)
+    /// ack volume out of their feed. See
+    /// `crate::sse::spawn_control_listen_worker`.
+    pub control_tx: broadcast::Sender<ControlNotifyEvent>,
 
     pub config: ServerConfig,
 

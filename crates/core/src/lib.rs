@@ -5,6 +5,7 @@
 //! and materializers on top.
 
 pub mod connection;
+pub mod control_dispatch;
 pub mod decode;
 pub mod ingest;
 pub mod reorg;
@@ -16,8 +17,14 @@ pub mod views;
 // downstream code uses `teesql_chain_indexer_core::EventStore`
 // instead of fishing through nested modules.
 pub use connection::{build_pool, ConnectionConfig};
+pub use control_dispatch::{
+    BufferedInstr, ControlDispatchOutcome, ControlOrderer, HoleReason, OrdererConfig,
+    DEFAULT_CONFIRMATIONS_REQUIRED, DEFAULT_MAX_BUFFER, DEFAULT_MAX_BUFFER_AGE,
+};
 pub use decode::{DecodedEvent, Decoder};
-pub use ingest::{Ingestor, IngestorBuilder, NotifyEvent};
+pub use ingest::{ControlNotifyEvent, Ingestor, IngestorBuilder, NotifyEvent};
 pub use reorg::{ReorgError, ReorgHandler};
-pub use store::{as_addr, as_hash, EventStore, WatchedContract};
+pub use store::{
+    as_addr, as_hash, ControlHoleRow, ControlInstructionRow, EventStore, WatchedContract,
+};
 pub use views::View;

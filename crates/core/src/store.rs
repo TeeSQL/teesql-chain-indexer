@@ -40,6 +40,54 @@ pub struct WatchedContract {
     pub from_block: u64,
 }
 
+/// One row of the `control_instructions` table. Used by the
+/// per-cluster `ControlOrderer` (Track D1) to:
+///  - hydrate `next_expected_nonce` at boot (cold-start helper),
+///  - replay the strictly-ordered backlog for a fresh subscriber that
+///    asks for `?since_nonce=N`,
+///  - rebuild `pending_finality` after a reorg or process restart so
+///    confirmations-required gating doesn't lose state across crashes.
+///
+/// Mirrors the schema in `deploy/provision.sql`. The fields are owned
+/// (`Vec<u8>`, `Vec<Vec<u8>>`) so the row can cross task boundaries
+/// without lifetime gymnastics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlInstructionRow {
+    pub id: i64,
+    pub cluster: [u8; 20],
+    pub instruction_id: [u8; 32],
+    pub nonce: u64,
+    pub target_members: Vec<[u8; 32]>,
+    pub expiry: u64,
+    pub salt: [u8; 32],
+    pub ciphertext: Vec<u8>,
+    pub ciphertext_hash: [u8; 32],
+    pub block_number: u64,
+    pub log_index: i32,
+    pub tx_hash: [u8; 32],
+}
+
+/// One row of the `control_holes` table. Hole rows are inserted by the
+/// per-cluster `ControlOrderer` when it stalls on a missing nonce
+/// (buffer expired, buffer full with the lowest nonce still missing,
+/// or operator-initiated manual mark). Spec §7.4. The dispatcher
+/// closes a hole by stamping `resolved_at` once the missing nonce is
+/// observed via either backfill or rebroadcast (§5.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlHoleRow {
+    pub id: i64,
+    pub cluster: [u8; 20],
+    pub missing_nonce: u64,
+    pub highest_buffered: u64,
+    pub reason: String,
+    /// `observed_at` and `resolved_at` are stored as raw `chrono`
+    /// timestamps; the ControlOrderer doesn't need them for ordering
+    /// (it gates on `next_expected_nonce` only) — they're carried for
+    /// the hub UI's per-cluster timeline + the SSE `hole` frame.
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 impl EventStore {
     /// Open a store against an already-built pool. Connection details
     /// (RA-TLS, role, credentials) live in `connection.rs`.
@@ -378,6 +426,246 @@ impl EventStore {
         .execute(&self.pool)
         .await?;
         Ok(instr.rows_affected() + acks.rows_affected())
+    }
+
+    /// Cold-start hydration for the per-cluster `ControlOrderer`
+    /// (Track D5). Returns the highest nonce that has reached the
+    /// configured confirmation depth (`max_block <= head -
+    /// confirmations_required`); the dispatcher's
+    /// `next_expected_nonce` is `MAX(nonce) + 1`. Returns `None` when
+    /// the cluster has no instructions past the confirmation gate yet
+    /// — fresh clusters start at `next_expected_nonce = 0`.
+    ///
+    /// Filters on `removed = false` so a reorg-rolled-back row never
+    /// resurrects as the "highest dispatched" nonce on restart.
+    /// Spec §7.3.
+    pub async fn highest_finalized_control_nonce(
+        &self,
+        cluster: [u8; 20],
+        max_block: u64,
+    ) -> anyhow::Result<Option<u64>> {
+        let max_block_i64 = i64::try_from(max_block)
+            .map_err(|_| anyhow::anyhow!("max_block {max_block} overflows i64"))?;
+        // SQL MAX() over an empty filtered set is NULL → bind into
+        // `Option<i64>` and treat the inner None as "no finalized
+        // instructions yet". `fetch_one` rather than `fetch_optional`
+        // because the aggregate query always returns one row, even
+        // when the inner value is NULL.
+        let row: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(nonce) FROM control_instructions \
+             WHERE cluster = $1 AND removed = false AND block_number <= $2",
+        )
+        .bind(&cluster[..])
+        .bind(max_block_i64)
+        .fetch_one(&self.pool)
+        .await?;
+        match row {
+            Some(n) if n < 0 => {
+                anyhow::bail!("highest_finalized_control_nonce returned negative nonce: {n}")
+            }
+            Some(n) => Ok(Some(n as u64)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read every live `control_instructions` row for `cluster` whose
+    /// nonce is `>= since_nonce` AND past the finality gate
+    /// (`block_number <= max_block`), ordered ascending by nonce.
+    /// Used by:
+    ///  - the SSE handler when a fresh subscriber asks for replay
+    ///    via `?since_nonce=N` (Track D5);
+    ///  - the `ControlOrderer` when it rebuilds buffer state after a
+    ///    reorg flipped `removed=true` on a chunk of rows.
+    ///
+    /// `removed=false` filter ensures a reorg-rolled-back row is not
+    /// re-served. Spec §7.3 + §7.6.
+    pub async fn list_finalized_control_instructions(
+        &self,
+        cluster: [u8; 20],
+        since_nonce: u64,
+        max_block: u64,
+    ) -> anyhow::Result<Vec<ControlInstructionRow>> {
+        let since_i64 = i64::try_from(since_nonce)
+            .map_err(|_| anyhow::anyhow!("since_nonce {since_nonce} overflows i64"))?;
+        let max_block_i64 = i64::try_from(max_block)
+            .map_err(|_| anyhow::anyhow!("max_block {max_block} overflows i64"))?;
+
+        let rows = sqlx::query(
+            "SELECT id, instruction_id, nonce, target_members, expiry, \
+                    salt, ciphertext, ciphertext_hash, \
+                    block_number, log_index, tx_hash \
+             FROM control_instructions \
+             WHERE cluster = $1 \
+               AND removed = false \
+               AND nonce >= $2 \
+               AND block_number <= $3 \
+             ORDER BY nonce ASC",
+        )
+        .bind(&cluster[..])
+        .bind(since_i64)
+        .bind(max_block_i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let instruction_id_b: Vec<u8> = row.try_get("instruction_id")?;
+            let nonce_i64: i64 = row.try_get("nonce")?;
+            let target_b: Vec<Vec<u8>> = row.try_get("target_members")?;
+            let expiry_i64: i64 = row.try_get("expiry")?;
+            let salt_b: Vec<u8> = row.try_get("salt")?;
+            let ciphertext: Vec<u8> = row.try_get("ciphertext")?;
+            let ciphertext_hash_b: Vec<u8> = row.try_get("ciphertext_hash")?;
+            let block_number_i64: i64 = row.try_get("block_number")?;
+            let log_index: i32 = row.try_get("log_index")?;
+            let tx_hash_b: Vec<u8> = row.try_get("tx_hash")?;
+
+            let nonce = u64::try_from(nonce_i64)
+                .map_err(|_| anyhow::anyhow!("control_instructions.nonce {nonce_i64} negative"))?;
+            let expiry = u64::try_from(expiry_i64).map_err(|_| {
+                anyhow::anyhow!("control_instructions.expiry {expiry_i64} negative")
+            })?;
+            let block_number = u64::try_from(block_number_i64).map_err(|_| {
+                anyhow::anyhow!("control_instructions.block_number {block_number_i64} negative")
+            })?;
+
+            let mut target_members = Vec::with_capacity(target_b.len());
+            for (i, t) in target_b.into_iter().enumerate() {
+                target_members.push(as_hash(&t).map_err(|e| {
+                    anyhow::anyhow!("control_instructions.target_members[{i}]: {e}")
+                })?);
+            }
+
+            out.push(ControlInstructionRow {
+                id,
+                cluster,
+                instruction_id: as_hash(&instruction_id_b)?,
+                nonce,
+                target_members,
+                expiry,
+                salt: as_hash(&salt_b)?,
+                ciphertext,
+                ciphertext_hash: as_hash(&ciphertext_hash_b)?,
+                block_number,
+                log_index,
+                tx_hash: as_hash(&tx_hash_b)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Insert a control-plane hole row. Idempotent under
+    /// `(cluster, missing_nonce)` so a re-fire of the same hole event
+    /// (orderer re-evaluates after a new event but the gap persists)
+    /// updates `highest_buffered` + `reason` in place rather than
+    /// stacking duplicates. `observed_at` is stamped only on first
+    /// insert (the partial unique index keeps the original value
+    /// intact). Returns the row id either way. Spec §7.4.
+    pub async fn record_hole(
+        &self,
+        cluster: [u8; 20],
+        missing_nonce: u64,
+        highest_buffered: u64,
+        reason: &str,
+    ) -> anyhow::Result<i64> {
+        let missing_i64 = i64::try_from(missing_nonce)
+            .map_err(|_| anyhow::anyhow!("missing_nonce {missing_nonce} overflows i64"))?;
+        let highest_i64 = i64::try_from(highest_buffered)
+            .map_err(|_| anyhow::anyhow!("highest_buffered {highest_buffered} overflows i64"))?;
+
+        // ON CONFLICT updates `highest_buffered` + `reason` so a
+        // long-lived hole's row reflects the current buffer state.
+        // `observed_at` keeps its original value; `resolved_at` is
+        // explicitly preserved to NULL only via DO NOTHING semantics
+        // — the UPDATE branch does NOT touch it, so a stale rebroadcast
+        // race that re-records before resolve_hole runs will not
+        // overwrite a closed row. We re-OPEN a previously-resolved
+        // row by clearing `resolved_at` here intentionally: if the
+        // dispatcher decides "hole at N" again post-resolve, the
+        // operator needs to see it.
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO control_holes \
+                 (cluster, missing_nonce, highest_buffered, reason) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (cluster, missing_nonce) DO UPDATE SET \
+                 highest_buffered = EXCLUDED.highest_buffered, \
+                 reason = EXCLUDED.reason, \
+                 resolved_at = NULL \
+             RETURNING id",
+        )
+        .bind(&cluster[..])
+        .bind(missing_i64)
+        .bind(highest_i64)
+        .bind(reason)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Stamp `resolved_at = now()` on an open hole. Returns true when
+    /// a row was updated (the hole was open), false when the hole was
+    /// already resolved or never existed. Idempotent: a duplicate
+    /// resolve call is a no-op.
+    /// Spec §7.4.
+    pub async fn resolve_hole(
+        &self,
+        cluster: [u8; 20],
+        missing_nonce: u64,
+    ) -> anyhow::Result<bool> {
+        let missing_i64 = i64::try_from(missing_nonce)
+            .map_err(|_| anyhow::anyhow!("missing_nonce {missing_nonce} overflows i64"))?;
+        let result = sqlx::query(
+            "UPDATE control_holes \
+             SET resolved_at = now() \
+             WHERE cluster = $1 AND missing_nonce = $2 AND resolved_at IS NULL",
+        )
+        .bind(&cluster[..])
+        .bind(missing_i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// List open (unresolved) holes for a cluster, ordered by
+    /// `missing_nonce` ascending. Used by the SSE handler at handshake
+    /// time to replay outstanding holes to a freshly-connected
+    /// subscriber so the hub UI doesn't miss a stall that happened
+    /// while no client was connected. Spec §7.4.
+    pub async fn list_open_holes(&self, cluster: [u8; 20]) -> anyhow::Result<Vec<ControlHoleRow>> {
+        let rows = sqlx::query(
+            "SELECT id, missing_nonce, highest_buffered, reason, \
+                    observed_at, resolved_at \
+             FROM control_holes \
+             WHERE cluster = $1 AND resolved_at IS NULL \
+             ORDER BY missing_nonce ASC",
+        )
+        .bind(&cluster[..])
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let missing_i64: i64 = row.try_get("missing_nonce")?;
+            let highest_i64: i64 = row.try_get("highest_buffered")?;
+            let reason: String = row.try_get("reason")?;
+            let observed_at: chrono::DateTime<chrono::Utc> = row.try_get("observed_at")?;
+            let resolved_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("resolved_at")?;
+            let missing = u64::try_from(missing_i64)
+                .map_err(|_| anyhow::anyhow!("missing_nonce negative: {missing_i64}"))?;
+            let highest = u64::try_from(highest_i64)
+                .map_err(|_| anyhow::anyhow!("highest_buffered negative: {highest_i64}"))?;
+            out.push(ControlHoleRow {
+                id,
+                cluster,
+                missing_nonce: missing,
+                highest_buffered: highest,
+                reason,
+                observed_at,
+                resolved_at,
+            });
+        }
+        Ok(out)
     }
 
     /// Read the per-contract cursor. Returns 0 when absent so the

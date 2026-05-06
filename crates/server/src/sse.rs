@@ -58,7 +58,7 @@ use crate::error::ApiError;
 use crate::routes::clusters::ClusterPath;
 use crate::routes::events::parse_kinds;
 use crate::state::MultiChainState;
-use teesql_chain_indexer_core::ingest::NotifyEvent;
+use teesql_chain_indexer_core::ingest::{ControlNotifyEvent, NotifyEvent};
 
 /// Per-connection recent-event-id cache used to deduplicate frames
 /// when the same `event_id` arrives via more than one path on the
@@ -409,6 +409,56 @@ async fn listen_loop(
             }
             Err(e) => {
                 tracing::warn!(error = %e, payload, "drop unparseable LISTEN payload");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---- Control-plane LISTEN worker (Track D3) -------------------------
+//
+// Twin of `spawn_listen_worker` for the dedicated
+// `chain_indexer_control` channel. The store's `notify_control` fires
+// `ControlNotifyEvent` payloads; this bridges them onto a separate
+// broadcast bus the per-cluster control SSE handler subscribes to.
+// Keeping the buses separate prevents the `/events/sse` consumers
+// from having to filter every per-instruction × per-member ack out
+// of their feed.
+
+/// Spawn the LISTEN→broadcast bridge for `chain_indexer_control`.
+pub fn spawn_control_listen_worker(
+    pool: sqlx::PgPool,
+    sender: broadcast::Sender<ControlNotifyEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match control_listen_loop(&pool, &sender).await {
+                Ok(()) => {
+                    tracing::warn!("control LISTEN loop exited cleanly; restarting");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "control LISTEN loop errored; restarting in 1s");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    })
+}
+
+async fn control_listen_loop(
+    pool: &sqlx::PgPool,
+    sender: &broadcast::Sender<ControlNotifyEvent>,
+) -> Result<(), sqlx::Error> {
+    let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+    listener.listen("chain_indexer_control").await?;
+    while let Some(notification) = listener.try_recv().await? {
+        let payload = notification.payload();
+        match serde_json::from_str::<ControlNotifyEvent>(payload) {
+            Ok(ev) => {
+                let _ = sender.send(ev);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, payload, "drop unparseable control LISTEN payload");
             }
         }
     }

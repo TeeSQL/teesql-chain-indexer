@@ -34,7 +34,7 @@ use grpc::ChainIndexerService;
 use metrics::Metrics;
 use state::MultiChainState;
 
-pub use sse::spawn_listen_worker;
+pub use sse::{spawn_control_listen_worker, spawn_listen_worker};
 
 /// Assemble the REST + SSE router. Mount at `/`; every path is
 /// already namespaced under `/v1/...`.
