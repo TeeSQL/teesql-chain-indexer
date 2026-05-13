@@ -17,6 +17,8 @@
 //! - `ClusterDestroyed(uint256)`
 //! - `ControlInstructionBroadcast(bytes32, bytes32, uint64, bytes32[], uint64, bytes32, bytes32, bytes)`
 //! - `ControlAck(bytes32, bytes32, bytes32, uint8, uint64, bytes32, bytes)`
+//! - `MemberWgPubkeySet(bytes32, string)` — fabric mesh WG pubkey registry
+//!   (Phase 1 of fabric cross-boundary; source: WgMeshFacet.sol)
 //!
 //! `EndpointUpdated`, `OnboardingPosted`, `MemberPassthroughCreated`,
 //! and `InstanceBindingVerified` exist on the diamond but are out of
@@ -84,6 +86,12 @@ sol! {
             bytes32 logPointer,
             bytes summary
         );
+
+        /// Emitted by `WgMeshFacet.setMemberWgPubkey` whenever a member
+        /// publishes (or rotates) its WireGuard pubkey. Fabric reads the
+        /// indexer's materialized `cluster_members.wg_pubkey_hex` column
+        /// + SSE stream to discover peers and bring up wg0.
+        event MemberWgPubkeySet(bytes32 indexed memberId, string wgPubkeyHex);
     }
 }
 
@@ -303,6 +311,38 @@ impl Decoder for ControlAckDecoder {
             "summary":       bytes_to_json(&decoded.summary),
             "_topic0":       bytes32_to_json(&IClusterDiamond::ControlAck::SIGNATURE_HASH),
             "_signature":    IClusterDiamond::ControlAck::SIGNATURE,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemberWgPubkeySet
+//
+// Source: `open-source/teesql-group-auth/src/facets/WgMeshFacet.sol`.
+// The fabric crate consumes this both via the materialized
+// `cluster_members.wg_pubkey_hex` REST column and the SSE
+// `member_wg_pubkey_set` stream to keep wg0 in sync with the chain.
+// ---------------------------------------------------------------------------
+
+pub struct MemberWgPubkeySetDecoder;
+
+impl Decoder for MemberWgPubkeySetDecoder {
+    fn topic0(&self) -> [u8; 32] {
+        IClusterDiamond::MemberWgPubkeySet::SIGNATURE_HASH.0
+    }
+
+    fn kind(&self) -> &'static str {
+        "MemberWgPubkeySet"
+    }
+
+    fn decode(&self, log: &Log) -> anyhow::Result<Value> {
+        let decoded = IClusterDiamond::MemberWgPubkeySet::decode_log(&log.inner)
+            .context("decode MemberWgPubkeySet log")?;
+        Ok(json!({
+            "memberId":     bytes32_to_json(&decoded.memberId),
+            "wgPubkeyHex":  decoded.wgPubkeyHex.clone(),
+            "_topic0":      bytes32_to_json(&IClusterDiamond::MemberWgPubkeySet::SIGNATURE_HASH),
+            "_signature":   IClusterDiamond::MemberWgPubkeySet::SIGNATURE,
         }))
     }
 }

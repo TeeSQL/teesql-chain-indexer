@@ -368,6 +368,111 @@ fn members_replay_member_retired_sets_retired_at() {
 }
 
 #[test]
+fn members_replay_member_wg_pubkey_set_populates_wg_pubkey_hex() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+
+    let pubkey = "0".repeat(64);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            200,
+            0,
+            "MemberWgPubkeySet",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkeyHex": pubkey.clone(),
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["wgPubkeyHex"], pubkey);
+    assert_eq!(m["dnsLabel"], "alpha");
+}
+
+#[test]
+fn members_replay_member_wg_pubkey_set_before_register_creates_stub() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+
+    let pubkey = "f".repeat(64);
+
+    let events = vec![event(
+        100,
+        0,
+        "MemberWgPubkeySet",
+        json!({
+            "memberId": member_id_str(0xa1),
+            "wgPubkeyHex": pubkey.clone(),
+        }),
+    )];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["wgPubkeyHex"], pubkey);
+    assert!(m["dnsLabel"].is_null());
+    assert!(m["registeredAt"].is_null());
+}
+
+#[test]
+fn members_replay_member_wg_pubkey_set_rotates_to_latest() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let old = "1".repeat(64);
+    let new = "2".repeat(64);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            200,
+            0,
+            "MemberWgPubkeySet",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkeyHex": old,
+            }),
+        ),
+        event(
+            300,
+            0,
+            "MemberWgPubkeySet",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkeyHex": new.clone(),
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["wgPubkeyHex"], new);
+}
+
+#[test]
 fn members_replay_endpoint_update_for_unseen_member_creates_stub() {
     let mut block_ts = HashMap::new();
     block_ts.insert(100u64, 1_700_000_000_i64);

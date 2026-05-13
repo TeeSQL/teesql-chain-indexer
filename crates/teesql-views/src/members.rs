@@ -1,5 +1,5 @@
 //! `cluster_members` materializer — driven by `MemberRegistered`,
-//! `PublicEndpointUpdated`, and `MemberRetired`.
+//! `PublicEndpointUpdated`, `MemberRetired`, and `MemberWgPubkeySet`.
 //!
 //! Each event touches a different subset of the row's columns:
 //!
@@ -59,6 +59,7 @@ impl View for MembersView {
             Some("MemberRegistered") => apply_member_registered(store, event).await,
             Some("PublicEndpointUpdated") => apply_public_endpoint_updated(store, event).await,
             Some("MemberRetired") => apply_member_retired(store, event).await,
+            Some("MemberWgPubkeySet") => apply_member_wg_pubkey_set(store, event).await,
             _ => Ok(()),
         }
     }
@@ -77,7 +78,7 @@ impl View for MembersView {
              JOIN blocks b ON b.chain_id = e.chain_id AND b.number = e.block_number \
              WHERE e.chain_id = $1 AND e.contract = $2 AND e.removed = false \
                AND e.block_number <= $3 \
-               AND e.decoded_kind IN ('MemberRegistered', 'PublicEndpointUpdated', 'MemberRetired') \
+               AND e.decoded_kind IN ('MemberRegistered', 'PublicEndpointUpdated', 'MemberRetired', 'MemberWgPubkeySet') \
              ORDER BY e.block_number, e.log_index",
         )
         .bind(chain_id)
@@ -196,6 +197,48 @@ async fn apply_public_endpoint_updated(store: &EventStore, event: &DecodedEvent)
     Ok(())
 }
 
+async fn apply_member_wg_pubkey_set(store: &EventStore, event: &DecodedEvent) -> Result<()> {
+    let payload = event
+        .decoded
+        .as_ref()
+        .ok_or_else(|| anyhow!("MemberWgPubkeySet event has no decoded payload"))?;
+
+    let member_id = decoded::member_id(payload, "memberId")?;
+    let wg_pubkey_hex = decoded::string(payload, "wgPubkeyHex")?.to_string();
+
+    // Upsert pattern mirrors PublicEndpointUpdated — if the row
+    // already exists, just stamp the new pubkey + bump `updated_at`;
+    // if it doesn't (out-of-order arrival or a stub-creating replay),
+    // insert a sparse row and warn.
+    let row = sqlx::query(
+        "INSERT INTO cluster_members \
+            (chain_id, cluster_address, member_id, wg_pubkey_hex) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (chain_id, cluster_address, member_id) DO UPDATE SET \
+             wg_pubkey_hex = EXCLUDED.wg_pubkey_hex, \
+             updated_at    = now() \
+         RETURNING (xmax = 0) AS inserted",
+    )
+    .bind(event.chain_id)
+    .bind(&event.contract[..])
+    .bind(&member_id[..])
+    .bind(&wg_pubkey_hex)
+    .fetch_one(store.pool())
+    .await
+    .context("upsert wg_pubkey_hex")?;
+
+    let inserted: bool = row.try_get("inserted")?;
+    if inserted {
+        warn!(
+            chain_id = event.chain_id,
+            cluster = %decoded::hex0x(&event.contract),
+            member = %decoded::hex0x(&member_id),
+            "MemberWgPubkeySet arrived before MemberRegistered; inserted stub row"
+        );
+    }
+    Ok(())
+}
+
 async fn apply_member_retired(store: &EventStore, event: &DecodedEvent) -> Result<()> {
     let payload = event
         .decoded
@@ -272,6 +315,7 @@ struct MemberRow {
     passthrough: Option<[u8; 20]>,
     dns_label: Option<String>,
     public_endpoint: Option<String>,
+    wg_pubkey_hex: Option<String>,
     registered_at: Option<i64>,
     retired_at: Option<i64>,
 }
@@ -284,6 +328,7 @@ impl MemberRow {
             "passthrough": self.passthrough.as_ref().map(|b| decoded::hex0x(b)),
             "dnsLabel": self.dns_label,
             "publicEndpoint": self.public_endpoint,
+            "wgPubkeyHex": self.wg_pubkey_hex,
             "registeredAt": self.registered_at,
             "retiredAt": self.retired_at,
         })
@@ -359,6 +404,20 @@ pub fn replay_in_memory(
                         chain_id = event.chain_id,
                         member = %decoded::hex0x(&member_id),
                         "replay: MemberRetired for unknown member — dropped"
+                    );
+                }
+            }
+            Some("MemberWgPubkeySet") => {
+                let member_id = decoded::member_id(payload, "memberId")?;
+                let pubkey = decoded::string(payload, "wgPubkeyHex")?.to_string();
+                let existed = members.contains_key(&member_id);
+                let row = members.entry(member_id).or_default();
+                row.wg_pubkey_hex = Some(pubkey);
+                if !existed {
+                    warn!(
+                        chain_id = event.chain_id,
+                        member = %decoded::hex0x(&member_id),
+                        "replay: MemberWgPubkeySet before MemberRegistered; stub row"
                     );
                 }
             }

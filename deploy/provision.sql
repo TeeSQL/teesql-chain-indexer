@@ -134,11 +134,23 @@ CREATE TABLE cluster_members (
   passthrough      bytea,
   dns_label        text,
   public_endpoint  text,
+  -- WireGuard pubkey hex (lowercase 64-char Curve25519, no 0x prefix).
+  -- Populated by `MemberWgPubkeySet` events emitted by WgMeshFacet
+  -- (Phase 1 fabric cross-boundary). NULL until the member's first
+  -- publish; fabric defers admission until non-NULL.
+  wg_pubkey_hex    text,
   registered_at    bigint,                     -- block timestamp
   retired_at       bigint,                     -- NULL = active
   updated_at       timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (chain_id, cluster_address, member_id)
 );
+
+-- Idempotent backfill of `wg_pubkey_hex` on clusters provisioned
+-- before Phase 1 fabric cross-boundary landed. `ADD COLUMN IF NOT
+-- EXISTS` is a no-op on a fresh DB where the column above already
+-- defines it; on an upgraded DB it bolts the column on without
+-- losing the existing roster.
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS wg_pubkey_hex text;
 
 CREATE TABLE cluster_lifecycle (
   chain_id         int NOT NULL,

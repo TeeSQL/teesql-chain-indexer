@@ -13,7 +13,7 @@ pub use teesql_chain_indexer_core::decode::Decoder;
 
 use cluster_diamond::{
     ClusterDestroyedDecoder, ControlAckDecoder, ControlInstructionBroadcastDecoder,
-    LeaderClaimedDecoder, MemberRegisteredDecoder, MemberRetiredDecoder,
+    LeaderClaimedDecoder, MemberRegisteredDecoder, MemberRetiredDecoder, MemberWgPubkeySetDecoder,
     PublicEndpointUpdatedDecoder,
 };
 use factory::ClusterDeployedDecoder;
@@ -36,6 +36,7 @@ pub fn all_decoders() -> Vec<Box<dyn Decoder>> {
         Box::new(ClusterDestroyedDecoder),
         Box::new(ControlInstructionBroadcastDecoder),
         Box::new(ControlAckDecoder),
+        Box::new(MemberWgPubkeySetDecoder),
     ]
 }
 
@@ -63,12 +64,23 @@ mod tests {
     #[test]
     fn all_decoders_count_matches_spec() {
         // 1 factory event + 5 lifecycle/membership cluster-diamond
-        // events + 2 control-plane events = 8 decoders.
-        // Track A4 added the control-plane pair
-        // (ControlInstructionBroadcast, ControlAck) — ABI bindings
-        // mirror crates/common/src/cluster_app.rs in the parent
-        // monorepo.
-        assert_eq!(all_decoders().len(), 8);
+        // events + 2 control-plane events + 1 WG-mesh fabric event
+        // = 9 decoders. Phase 1 of fabric cross-boundary added
+        // MemberWgPubkeySet alongside the existing pairs.
+        assert_eq!(all_decoders().len(), 9);
+    }
+
+    /// Pin `MemberWgPubkeySet` decoder presence so a future
+    /// `all_decoders()` shuffle that drops the registration trips
+    /// here instead of silently letting fabric's mesh discovery
+    /// drift off chain.
+    #[test]
+    fn all_decoders_includes_member_wg_pubkey_set() {
+        let kinds: Vec<&'static str> = all_decoders().iter().map(|d| d.kind()).collect();
+        assert!(
+            kinds.contains(&"MemberWgPubkeySet"),
+            "all_decoders() must register MemberWgPubkeySet: {kinds:?}"
+        );
     }
 
     /// Pin the control-plane decoders' presence in `all_decoders()`
