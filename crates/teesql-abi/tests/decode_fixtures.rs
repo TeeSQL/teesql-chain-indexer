@@ -17,9 +17,10 @@ use alloy::sol_types::SolEvent;
 use serde_json::json;
 
 use teesql_chain_indexer_abi::cluster_diamond::{
-    ClusterDestroyedDecoder, ComposeHashAllowedDecoder, ComposeHashRemovedDecoder, IClusterDiamond,
-    LeaderClaimedDecoder, MemberRegisteredDecoder, MemberRetiredDecoder,
-    MemberWgPubkeySetV2Decoder, PublicEndpointUpdatedDecoder, TcbDegradedDecoder,
+    ClusterDestroyedDecoder, ComposeHashAddedDecoder, ComposeHashAllowedDecoder,
+    ComposeHashRemovedDecoder, IClusterDiamond, LeaderClaimedDecoder, MemberRegisteredDecoder,
+    MemberRetiredDecoder, MemberWgPubkeySetV2Decoder, PublicEndpointUpdatedDecoder,
+    TcbDegradedDecoder,
 };
 use teesql_chain_indexer_abi::factory::{ClusterDeployedDecoder, IClusterDiamondFactory};
 use teesql_chain_indexer_abi::Decoder;
@@ -392,6 +393,64 @@ fn compose_hash_allowed_and_removed_have_distinct_topic0() {
         allowed, removed,
         "ComposeHashAllowed and ComposeHashRemoved must hash to distinct topic0 values"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ComposeHashAdded (legacy) — single non-indexed `bytes32`
+//
+// Source: `IAppAuthBasicManagement.sol` line 13 (mirrored from dstack's
+// auth-eth contracts). Kept registered so the indexer can decode
+// historical events emitted before the W0-001 rename to
+// `ComposeHashAllowed`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compose_hash_added_decodes_to_expected_json() {
+    let compose_hash = FixedBytes::<32>::from([0xa1u8; 32]);
+
+    let topics = vec![IClusterDiamond::ComposeHashAdded::SIGNATURE_HASH];
+    let data = IClusterDiamond::ComposeHashAdded {
+        composeHash: compose_hash,
+    }
+    .encode_data();
+    let log = make_rpc_log(topics, data);
+
+    let decoded = ComposeHashAddedDecoder.decode(&log).unwrap();
+    let expected = json!({
+        "composeHash": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "_topic0":     format!("0x{}", hex::encode(IClusterDiamond::ComposeHashAdded::SIGNATURE_HASH.as_slice())),
+        "_signature":  "ComposeHashAdded(bytes32)",
+    });
+    assert_eq!(decoded, expected);
+}
+
+/// Decode-time JSON shape parity with `ComposeHashAllowed`: both
+/// decoders are routed through the same materializer apply path, so
+/// the field names must match exactly (`composeHash` is the
+/// load-bearing key the materializer pulls out via
+/// `decoded::member_id`). A drift here would make legacy events
+/// silently fail at materialization with a missing-field error.
+#[test]
+fn compose_hash_added_payload_shape_matches_compose_hash_allowed() {
+    let compose_hash = FixedBytes::<32>::from([0xbeu8; 32]);
+
+    let added_topics = vec![IClusterDiamond::ComposeHashAdded::SIGNATURE_HASH];
+    let added_data = IClusterDiamond::ComposeHashAdded {
+        composeHash: compose_hash,
+    }
+    .encode_data();
+    let added_log = make_rpc_log(added_topics, added_data);
+    let added = ComposeHashAddedDecoder.decode(&added_log).unwrap();
+
+    let allowed_topics = vec![IClusterDiamond::ComposeHashAllowed::SIGNATURE_HASH];
+    let allowed_data = IClusterDiamond::ComposeHashAllowed {
+        composeHash: compose_hash,
+    }
+    .encode_data();
+    let allowed_log = make_rpc_log(allowed_topics, allowed_data);
+    let allowed = ComposeHashAllowedDecoder.decode(&allowed_log).unwrap();
+
+    assert_eq!(added["composeHash"], allowed["composeHash"]);
 }
 
 // ---------------------------------------------------------------------------

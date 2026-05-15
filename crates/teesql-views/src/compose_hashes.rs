@@ -1,5 +1,6 @@
 //! `cluster_compose_hashes` materializer — driven by
-//! `ComposeHashAllowed` / `ComposeHashRemoved`.
+//! `ComposeHashAllowed` / `ComposeHashRemoved` (and the legacy
+//! `ComposeHashAdded` synonym emitted by pre-rename dstack contracts).
 //!
 //! Per unified-network-design §4.2, the cluster's set of acceptable
 //! MRTDs is the canonical allowlist that fabric uses for admission.
@@ -10,10 +11,30 @@
 //! `removed_at` block timestamps; a hash that has been re-added after
 //! removal flips `removed_at` back to NULL.
 //!
-//! Re-application of the same event (WS replay, HA double-write) is
-//! idempotent: the upsert clamps `allowed_at` to the earliest seen
-//! and `removed_at` to the latest, so out-of-order delivery still
-//! converges to the chain-canonical state.
+//! ## Stale-replay invariant
+//!
+//! Each row carries the `(block_number, log_index)` coordinates of
+//! the most-recent event applied (`last_event_block`,
+//! `last_event_log_index`). On every incoming event the materializer
+//! compares the incoming coordinates against the stored pair before
+//! flipping `removed_at`:
+//!
+//! - An allow strictly newer than the stored coordinates may clear
+//!   `removed_at` (a genuine re-allow after a removal).
+//! - An allow at or older than the stored coordinates is treated as
+//!   a stale replay — `allowed_at` still picks up the `LEAST` clamp
+//!   (so the canonical first-allow timestamp is preserved), but
+//!   `removed_at` is left untouched. This closes the security bug
+//!   where a WS-replayed duplicate `ComposeHashAllowed` arriving
+//!   after a `ComposeHashRemoved` could reactivate a revoked MRTD.
+//! - A remove strictly newer than the stored coordinates stamps
+//!   `removed_at = block_ts`; older removes are no-ops via the same
+//!   tuple comparison.
+//!
+//! The `allowed_at` / `removed_at` order-independent clamps
+//! (`LEAST` / `GREATEST`) remain as before; the tuple comparison is
+//! a strict gate layered on top of those for the
+//! `removed_at = NULL` reactivation transition specifically.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -46,7 +67,15 @@ impl View for ComposeHashesView {
 
     async fn apply(&self, store: &EventStore, event: &DecodedEvent) -> Result<()> {
         match event.kind.as_deref() {
-            Some("ComposeHashAllowed") => apply_compose_hash_allowed(store, event).await,
+            // `ComposeHashAdded` is the legacy event name dstack
+            // contracts emitted before the W0-001 rename; the new
+            // `ComposeHashAllowed` carries identical wire layout.
+            // Both route through the same apply path so the
+            // materialized table is correct across the rename
+            // boundary.
+            Some("ComposeHashAllowed") | Some("ComposeHashAdded") => {
+                apply_compose_hash_allowed(store, event).await
+            }
             Some("ComposeHashRemoved") => apply_compose_hash_removed(store, event).await,
             _ => Ok(()),
         }
@@ -66,7 +95,7 @@ impl View for ComposeHashesView {
              JOIN blocks b ON b.chain_id = e.chain_id AND b.number = e.block_number \
              WHERE e.chain_id = $1 AND e.contract = $2 AND e.removed = false \
                AND e.block_number <= $3 \
-               AND e.decoded_kind IN ('ComposeHashAllowed', 'ComposeHashRemoved') \
+               AND e.decoded_kind IN ('ComposeHashAllowed', 'ComposeHashAdded', 'ComposeHashRemoved') \
              ORDER BY e.block_number, e.log_index",
         )
         .bind(chain_id)
@@ -106,25 +135,58 @@ async fn apply_compose_hash_allowed(store: &EventStore, event: &DecodedEvent) ->
         .ok_or_else(|| anyhow!("ComposeHashAllowed event has no decoded payload"))?;
     let compose_hash = decoded::member_id(payload, "composeHash")?;
     let allowed_at = lookup_block_ts(store, event.chain_id, event.block_number).await?;
+    let event_block = i64::try_from(event.block_number).context("block_number overflows i64")?;
+    let event_log_index = event.log_index;
 
-    // `LEAST` clamp on `allowed_at` so an out-of-order replay that
-    // delivers a later allow before the original first-add doesn't
-    // backdate the row. Re-allowing a previously-removed hash clears
-    // `removed_at` so fabric's allowlist view picks the row back up
-    // without an explicit "re-allowed" event kind.
+    // `LEAST` clamp on `allowed_at` is order-independent (the
+    // canonical first-allow timestamp wins), so it runs every time.
+    //
+    // The `removed_at` clear and `last_event_*` advance are gated on
+    // a strict `(EXCLUDED.block, EXCLUDED.log_index) > (stored, ...)`
+    // tuple comparison — only an allow strictly newer than the most
+    // recent applied event re-activates the row. A NULL stored
+    // coordinate (no prior event, or pre-migration row) is treated
+    // as "always older" via `COALESCE`, so the very first event
+    // wins unconditionally. This closes the security bug where a
+    // duplicate `ComposeHashAllowed` re-delivered after a
+    // `ComposeHashRemoved` would otherwise reactivate the revoked
+    // MRTD.
     sqlx::query(
         "INSERT INTO cluster_compose_hashes \
-            (chain_id, cluster_address, compose_hash, allowed_at, removed_at) \
-         VALUES ($1, $2, $3, $4, NULL) \
+            (chain_id, cluster_address, compose_hash, allowed_at, removed_at, \
+             last_event_block, last_event_log_index) \
+         VALUES ($1, $2, $3, $4, NULL, $5, $6) \
          ON CONFLICT (chain_id, cluster_address, compose_hash) DO UPDATE SET \
              allowed_at = LEAST(cluster_compose_hashes.allowed_at, EXCLUDED.allowed_at), \
-             removed_at = NULL, \
+             removed_at = CASE \
+                 WHEN (EXCLUDED.last_event_block, EXCLUDED.last_event_log_index) \
+                    > (COALESCE(cluster_compose_hashes.last_event_block, -1), \
+                       COALESCE(cluster_compose_hashes.last_event_log_index, -1)) \
+                 THEN NULL \
+                 ELSE cluster_compose_hashes.removed_at \
+             END, \
+             last_event_block = CASE \
+                 WHEN (EXCLUDED.last_event_block, EXCLUDED.last_event_log_index) \
+                    > (COALESCE(cluster_compose_hashes.last_event_block, -1), \
+                       COALESCE(cluster_compose_hashes.last_event_log_index, -1)) \
+                 THEN EXCLUDED.last_event_block \
+                 ELSE cluster_compose_hashes.last_event_block \
+             END, \
+             last_event_log_index = CASE \
+                 WHEN (EXCLUDED.last_event_block, EXCLUDED.last_event_log_index) \
+                    > (COALESCE(cluster_compose_hashes.last_event_block, -1), \
+                       COALESCE(cluster_compose_hashes.last_event_log_index, -1)) \
+                 THEN EXCLUDED.last_event_log_index \
+                 ELSE cluster_compose_hashes.last_event_log_index \
+             END, \
              updated_at = now()",
     )
     .bind(event.chain_id)
     .bind(&event.contract[..])
     .bind(&compose_hash[..])
     .bind(allowed_at)
+    .bind(event_block)
+    .bind(event_log_index)
     .execute(store.pool())
     .await
     .context("upsert cluster_compose_hashes for ComposeHashAllowed")?;
@@ -139,27 +201,54 @@ async fn apply_compose_hash_removed(store: &EventStore, event: &DecodedEvent) ->
         .ok_or_else(|| anyhow!("ComposeHashRemoved event has no decoded payload"))?;
     let compose_hash = decoded::member_id(payload, "composeHash")?;
     let removed_at = lookup_block_ts(store, event.chain_id, event.block_number).await?;
+    let event_block = i64::try_from(event.block_number).context("block_number overflows i64")?;
+    let event_log_index = event.log_index;
 
-    // `GREATEST` on `removed_at` so a later re-removal sticks even
-    // when an out-of-order replay delivers an earlier removal first.
-    // If the row doesn't exist yet (removal observed before its
-    // matching add — out-of-order ingest), insert a sparse row with
-    // a NULL `allowed_at` so the audit trail remains complete.
+    // Mirror-symmetric to the allow path: `removed_at` is stamped
+    // only when the incoming coordinates are strictly newer than
+    // anything previously applied. A `GREATEST` clamp on
+    // `removed_at` itself would suffice to defeat WS-replay
+    // duplicates of the SAME remove, but it isn't enough on its
+    // own — without the tuple comparison the row's
+    // `last_event_block` / `last_event_log_index` would drift away
+    // from the true latest event and the allow path could no longer
+    // detect a stale duplicate allow. Both columns must be updated
+    // by the same comparison so the pair stays consistent.
     sqlx::query(
         "INSERT INTO cluster_compose_hashes \
-            (chain_id, cluster_address, compose_hash, allowed_at, removed_at) \
-         VALUES ($1, $2, $3, NULL, $4) \
+            (chain_id, cluster_address, compose_hash, allowed_at, removed_at, \
+             last_event_block, last_event_log_index) \
+         VALUES ($1, $2, $3, NULL, $4, $5, $6) \
          ON CONFLICT (chain_id, cluster_address, compose_hash) DO UPDATE SET \
-             removed_at = GREATEST(\
-                 COALESCE(cluster_compose_hashes.removed_at, EXCLUDED.removed_at), \
-                 EXCLUDED.removed_at\
-             ), \
+             removed_at = CASE \
+                 WHEN (EXCLUDED.last_event_block, EXCLUDED.last_event_log_index) \
+                    > (COALESCE(cluster_compose_hashes.last_event_block, -1), \
+                       COALESCE(cluster_compose_hashes.last_event_log_index, -1)) \
+                 THEN EXCLUDED.removed_at \
+                 ELSE cluster_compose_hashes.removed_at \
+             END, \
+             last_event_block = CASE \
+                 WHEN (EXCLUDED.last_event_block, EXCLUDED.last_event_log_index) \
+                    > (COALESCE(cluster_compose_hashes.last_event_block, -1), \
+                       COALESCE(cluster_compose_hashes.last_event_log_index, -1)) \
+                 THEN EXCLUDED.last_event_block \
+                 ELSE cluster_compose_hashes.last_event_block \
+             END, \
+             last_event_log_index = CASE \
+                 WHEN (EXCLUDED.last_event_block, EXCLUDED.last_event_log_index) \
+                    > (COALESCE(cluster_compose_hashes.last_event_block, -1), \
+                       COALESCE(cluster_compose_hashes.last_event_log_index, -1)) \
+                 THEN EXCLUDED.last_event_log_index \
+                 ELSE cluster_compose_hashes.last_event_log_index \
+             END, \
              updated_at = now()",
     )
     .bind(event.chain_id)
     .bind(&event.contract[..])
     .bind(&compose_hash[..])
     .bind(removed_at)
+    .bind(event_block)
+    .bind(event_log_index)
     .execute(store.pool())
     .await
     .context("upsert cluster_compose_hashes for ComposeHashRemoved")?;
@@ -189,6 +278,11 @@ async fn lookup_block_ts(store: &EventStore, chain_id: i32, block_number: u64) -
 struct ComposeHashRow {
     allowed_at: Option<i64>,
     removed_at: Option<i64>,
+    /// `(block_number, log_index)` of the most-recent event applied
+    /// to this row. Compared as a tuple before flipping `removed_at`
+    /// on allow or stamping it on remove; mirrors the SQL apply
+    /// path's stale-replay-cannot-reactivate invariant.
+    last_event: Option<(u64, i32)>,
 }
 
 impl ComposeHashRow {
@@ -225,28 +319,50 @@ pub fn replay_in_memory(
             None => continue,
         };
         let ts = block_ts.get(&event.block_number).copied();
+        let incoming_coord = (event.block_number, event.log_index);
 
         match event.kind.as_deref() {
-            Some("ComposeHashAllowed") => {
+            // Treat legacy `ComposeHashAdded` as a synonym for the
+            // post-rename `ComposeHashAllowed` so historical events
+            // emitted before the W0-001 contract rename converge to
+            // the same active-set state on replay.
+            Some("ComposeHashAllowed") | Some("ComposeHashAdded") => {
                 let compose_hash = decoded::member_id(payload, "composeHash")?;
                 let row = hashes.entry(compose_hash).or_default();
+                // `allowed_at` clamp is order-independent: the
+                // canonical first-allow timestamp wins regardless
+                // of delivery order.
                 row.allowed_at = match (row.allowed_at, ts) {
                     (Some(prev), Some(new)) => Some(prev.min(new)),
                     (Some(prev), None) => Some(prev),
                     (None, Some(new)) => Some(new),
                     (None, None) => None,
                 };
-                row.removed_at = None;
+                // Strict tuple comparison: only an allow strictly
+                // newer than the most-recent event clears
+                // `removed_at`. A duplicate older allow
+                // re-delivered after a removal must NOT
+                // reactivate the row.
+                let is_newer = match row.last_event {
+                    Some(prev) => incoming_coord > prev,
+                    None => true,
+                };
+                if is_newer {
+                    row.removed_at = None;
+                    row.last_event = Some(incoming_coord);
+                }
             }
             Some("ComposeHashRemoved") => {
                 let compose_hash = decoded::member_id(payload, "composeHash")?;
                 let row = hashes.entry(compose_hash).or_default();
-                row.removed_at = match (row.removed_at, ts) {
-                    (Some(prev), Some(new)) => Some(prev.max(new)),
-                    (Some(prev), None) => Some(prev),
-                    (None, Some(new)) => Some(new),
-                    (None, None) => None,
+                let is_newer = match row.last_event {
+                    Some(prev) => incoming_coord > prev,
+                    None => true,
                 };
+                if is_newer {
+                    row.removed_at = ts;
+                    row.last_event = Some(incoming_coord);
+                }
             }
             _ => continue,
         }

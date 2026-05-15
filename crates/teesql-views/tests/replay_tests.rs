@@ -903,6 +903,201 @@ fn members_replay_tcb_degraded_latest_event_wins() {
     assert_eq!(m["tcbDegradedAt"], 1_700_002_000_i64);
 }
 
+/// Stale-replay regression test for the W1-002 review finding
+/// MEDIUM-1 (V2 path): a duplicate older `MemberWgPubkeySetV2`
+/// re-delivered after a rotation must NOT revert the row to the
+/// older pubkey. If the materializer overwrote unconditionally, a
+/// WS replay of the pre-rotation event would corrupt the
+/// admission cache and fabric would refuse the rotated peer.
+#[test]
+fn members_replay_stale_v2_does_not_revert_after_rotation() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let pubkey_old = bytes32_str(0x55);
+    let pubkey_new = bytes32_str(0x66);
+    let quote_old = bytes32_str(0x77);
+    let quote_new = bytes32_str(0x88);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            200,
+            0,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": pubkey_old.clone(),
+                "quoteHash": quote_old.clone(),
+            }),
+        ),
+        event(
+            300,
+            0,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": pubkey_new.clone(),
+                "quoteHash": quote_new.clone(),
+            }),
+        ),
+        // WS replay re-delivers the pre-rotation event AFTER the
+        // rotation. Stale-replay guard must reject the overwrite.
+        event(
+            200,
+            0,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": pubkey_old,
+                "quoteHash": quote_old,
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(
+        m["wgPubkey"], pubkey_new,
+        "stale MemberWgPubkeySetV2 replay must NOT revert the rotated pubkey"
+    );
+    assert_eq!(
+        m["quoteHash"], quote_new,
+        "stale MemberWgPubkeySetV2 replay must NOT revert the rotated quote_hash"
+    );
+}
+
+/// Stale-replay regression test for the W1-002 review finding
+/// MEDIUM-1 (TCB path): a duplicate older `TcbDegraded` re-delivered
+/// after a newer alert must NOT roll back the column. Operators
+/// alert on the column directly; a regression here would mute a
+/// real critical event with a stale warn.
+#[test]
+fn members_replay_stale_tcb_degraded_does_not_revert_severity() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            200,
+            0,
+            "TcbDegraded",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "severity": 1,
+            }),
+        ),
+        event(
+            300,
+            0,
+            "TcbDegraded",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "severity": 2,
+            }),
+        ),
+        // WS replay re-delivers the earlier warn AFTER the critical
+        // alert. Stale-replay guard must keep the critical state.
+        event(
+            200,
+            0,
+            "TcbDegraded",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "severity": 1,
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(
+        m["tcbSeverity"], 2,
+        "stale TcbDegraded replay must NOT roll back severity"
+    );
+    assert_eq!(
+        m["tcbDegradedAt"], 1_700_002_000_i64,
+        "stale TcbDegraded replay must NOT roll back tcb_degraded_at"
+    );
+}
+
+/// Two `MemberWgPubkeySetV2` events at the same block but different
+/// `log_index` — tuple comparison must use the log_index to break
+/// the tie correctly. The higher log_index wins.
+#[test]
+fn members_replay_v2_same_block_higher_log_index_wins() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+
+    let pubkey_old = bytes32_str(0x55);
+    let pubkey_new = bytes32_str(0x66);
+    let quote_old = bytes32_str(0x77);
+    let quote_new = bytes32_str(0x88);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            200,
+            0,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": pubkey_old.clone(),
+                "quoteHash": quote_old.clone(),
+            }),
+        ),
+        // Higher log_index at the SAME block — must win.
+        event(
+            200,
+            1,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": pubkey_new.clone(),
+                "quoteHash": quote_new.clone(),
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["wgPubkey"], pubkey_new);
+    assert_eq!(m["quoteHash"], quote_new);
+}
+
 // ---------------------------------------------------------------------------
 // ComposeHashesView (unified-network-design §4.2)
 // ---------------------------------------------------------------------------
@@ -1073,6 +1268,202 @@ fn compose_hashes_replay_multiple_hashes_independent_state() {
     assert_eq!(arr[0]["active"], true);
     assert_eq!(arr[1]["composeHash"], h_high);
     assert_eq!(arr[1]["active"], false);
+}
+
+/// Security regression test for the W1-002 review finding HIGH-1:
+/// a stale `ComposeHashAllowed` re-delivered after a
+/// `ComposeHashRemoved` (e.g. via WS replay of an event that has
+/// since been superseded on chain) must NOT clear `removed_at`. If
+/// the materializer reactivated the row on stale replay, a revoked
+/// MRTD would silently rejoin the cluster's allowlist.
+#[test]
+fn compose_hashes_replay_stale_allow_does_not_reactivate_after_remove() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+
+    let hash = bytes32_str(0xfe);
+    let events = vec![
+        event(
+            100,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            200,
+            0,
+            "ComposeHashRemoved",
+            json!({"composeHash": hash.clone()}),
+        ),
+        // WS replay re-delivers the original allow AFTER the
+        // remove. The materializer must observe that the incoming
+        // event's `(block, log_index)` is OLDER than the remove
+        // and leave `removed_at` untouched.
+        event(
+            100,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+    ];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let row = &result["composeHashes"][0];
+    assert_eq!(
+        row["removedAt"], 1_700_001_000_i64,
+        "stale ComposeHashAllowed replayed after a remove must NOT clear removed_at"
+    );
+    assert_eq!(
+        row["active"], false,
+        "stale ComposeHashAllowed replay must NOT reactivate a revoked MRTD"
+    );
+    assert_eq!(row["allowedAt"], 1_700_000_000_i64);
+}
+
+/// Complementary positive case: a GENUINE re-add at a later block
+/// after a remove DOES reactivate. Confirms the tuple comparison
+/// is strict-inequality (not e.g. always-false).
+#[test]
+fn compose_hashes_replay_re_add_at_later_block_does_reactivate() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let hash = bytes32_str(0xfe);
+    let events = vec![
+        event(
+            100,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            200,
+            0,
+            "ComposeHashRemoved",
+            json!({"composeHash": hash.clone()}),
+        ),
+        // Genuine re-add at a strictly newer block: this MUST
+        // reactivate the row (clear `removed_at` back to NULL).
+        event(
+            300,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+    ];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let row = &result["composeHashes"][0];
+    assert!(
+        row["removedAt"].is_null(),
+        "genuine re-add at a later block MUST clear removed_at"
+    );
+    assert_eq!(row["active"], true);
+    // `allowed_at` keeps the earliest seen (the canonical first allow).
+    assert_eq!(row["allowedAt"], 1_700_000_000_i64);
+}
+
+/// `ComposeHashAdded` (legacy synonym, pre-W0-001-rename) must
+/// drive the same active-set materialization as
+/// `ComposeHashAllowed`. Tests both that the legacy event kind is
+/// honored on its own and that mixing both kinds across an event
+/// stream converges to the correct state.
+#[test]
+fn compose_hashes_replay_legacy_compose_hash_added_marks_row_active() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+
+    let hash = bytes32_str(0xa1);
+    let events = vec![event(
+        100,
+        0,
+        "ComposeHashAdded",
+        json!({"composeHash": hash.clone()}),
+    )];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let row = &result["composeHashes"][0];
+    assert_eq!(row["composeHash"], hash);
+    assert_eq!(row["allowedAt"], 1_700_000_000_i64);
+    assert!(row["removedAt"].is_null());
+    assert_eq!(row["active"], true);
+}
+
+/// A cluster mid-cutover may emit the legacy `ComposeHashAdded`
+/// for a hash, then `ComposeHashRemoved`, then later re-add with
+/// the post-rename `ComposeHashAllowed`. All three kinds must
+/// converge to the chain-canonical active state.
+#[test]
+fn compose_hashes_replay_legacy_added_then_remove_then_allowed_reactivates() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let hash = bytes32_str(0xa2);
+    let events = vec![
+        event(
+            100,
+            0,
+            "ComposeHashAdded",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            200,
+            0,
+            "ComposeHashRemoved",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            300,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+    ];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let row = &result["composeHashes"][0];
+    assert_eq!(row["active"], true);
+    assert!(row["removedAt"].is_null());
+    assert_eq!(row["allowedAt"], 1_700_000_000_i64);
+}
+
+/// Mirror of `compose_hashes_replay_stale_allow_does_not_reactivate_after_remove`
+/// but with the legacy event name: a stale `ComposeHashAdded`
+/// replayed after a `ComposeHashRemoved` must not reactivate
+/// either. Both names route through the same apply path, so the
+/// stale-replay guard must apply to both.
+#[test]
+fn compose_hashes_replay_stale_legacy_added_does_not_reactivate_after_remove() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+
+    let hash = bytes32_str(0xa3);
+    let events = vec![
+        event(
+            100,
+            0,
+            "ComposeHashAdded",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            200,
+            0,
+            "ComposeHashRemoved",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            100,
+            0,
+            "ComposeHashAdded",
+            json!({"composeHash": hash.clone()}),
+        ),
+    ];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let row = &result["composeHashes"][0];
+    assert_eq!(row["removedAt"], 1_700_001_000_i64);
+    assert_eq!(row["active"], false);
 }
 
 #[test]
