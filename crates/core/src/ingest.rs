@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::consensus::BlockHeader;
+use alloy::consensus::{BlockHeader, Transaction};
 use alloy::network::primitives::HeaderResponse;
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -167,6 +167,10 @@ pub struct Ingestor {
     views: Arc<Vec<Box<dyn View>>>,
     finality_depth: u64,
     notify_tx: Option<mpsc::Sender<NotifyEvent>>,
+    /// Optional R2 mirror for `MemberWgPubkeySetV2` quote bytes
+    /// (unified-network-design §9.2). Fire-and-forget: a failed upload
+    /// never fails the DB write. Defaults to `None` (mirror disabled).
+    quote_r2_mirror: Option<Arc<dyn crate::r2_mirror::R2QuoteMirror>>,
 }
 
 impl std::fmt::Debug for Ingestor {
@@ -736,7 +740,7 @@ impl Ingestor {
     /// Keeping the reorg branch out of here breaks the
     /// `process_log → handle_reorg → cold_start_backfill →
     /// process_log` recursion the compiler refuses to size.
-    async fn process_log<P>(&self, _provider: &P, log: Log) -> anyhow::Result<()>
+    async fn process_log<P>(&self, provider: &P, log: Log) -> anyhow::Result<()>
     where
         P: Provider,
     {
@@ -838,6 +842,33 @@ impl Ingestor {
                         log_index = event.log_index,
                         error = %e,
                         "ControlAck insert/notify failed; retry on next replay"
+                    );
+                }
+            }
+            // V2 admission event: the on-chain payload is just the
+            // `(memberId, wgPubkey, quoteHash)` triple; the indexer
+            // recovers the ~4.5 KB TDX quote bytes from the originating
+            // tx's calldata and persists them in `cluster_member_quotes`
+            // so the REST quote surface (§9.2) can serve them by hash.
+            //
+            // Failures log and move on for the same reason as the
+            // control-plane branches above: the generic `events` row is
+            // already in place, so a future replay re-runs this branch
+            // idempotently against the unique
+            // `(chain_id, cluster_address, member_id, quote_hash)`
+            // primary key on `cluster_member_quotes`.
+            Some("MemberWgPubkeySetV2") => {
+                if let Err(e) = self
+                    .recover_attested_quote_from_event(provider, &event)
+                    .await
+                {
+                    tracing::warn!(
+                        chain_id = self.chain_id,
+                        block = event.block_number,
+                        log_index = event.log_index,
+                        tx_hash = %hex::encode(event.tx_hash),
+                        error = %e,
+                        "MemberWgPubkeySetV2 quote-byte recovery failed; retry on next replay"
                     );
                 }
             }
@@ -1047,6 +1078,186 @@ impl Ingestor {
         Ok(())
     }
 
+    /// Recover and persist the raw TDX quote bytes referenced by a
+    /// `MemberWgPubkeySetV2` event. Fetches the originating tx via
+    /// `eth_getTransactionByHash`, scans the input for the
+    /// `setMemberWgPubkeyAttested` selector, ABI-decodes the call, and
+    /// upserts a `cluster_member_quotes` row.
+    ///
+    /// Returns early with `Ok(())` when:
+    ///   - a row already exists for the `(member_id, quote_hash)`
+    ///     content-address (re-observation under WS replay), or
+    ///   - the cluster recovers the bytes but `keccak256(bytes) !=
+    ///     quoteHash` (logs at error, no row written).
+    ///
+    /// The on-chain V2 surface already enforces the hash commitment, so
+    /// a mismatch here would indicate either a buggy tx-search match or
+    /// an out-of-sync provider response. Either way, refusing to write
+    /// the row preserves the table's invariant that
+    /// `keccak256(quote_bytes) == quote_hash` for every persisted row.
+    async fn recover_attested_quote_from_event<P>(
+        &self,
+        provider: &P,
+        event: &DecodedEvent,
+    ) -> anyhow::Result<()>
+    where
+        P: Provider,
+    {
+        let payload = event
+            .decoded
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("MemberWgPubkeySetV2 event has no decoded payload"))?;
+
+        let member_id = parse_bytes32_field(payload, "memberId")?;
+        let wg_pubkey = parse_bytes32_field(payload, "wgPubkey")?;
+        let quote_hash = parse_bytes32_field(payload, "quoteHash")?;
+
+        // Idempotent short-circuit: if the content-addressed row already
+        // exists we don't need to refetch the tx. `eth_getTransactionByHash`
+        // is the expensive step in this branch (RPC round-trip, full tx
+        // body fetch), so the pre-check pays for itself on every replay
+        // or backfill overlap.
+        if self
+            .store
+            .member_quote_by_hash(event.contract, member_id, quote_hash)
+            .await?
+            .is_some()
+        {
+            tracing::trace!(
+                chain_id = self.chain_id,
+                cluster = %hex::encode(event.contract),
+                member = %hex::encode(member_id),
+                quote_hash = %hex::encode(quote_hash),
+                "MemberWgPubkeySetV2 quote already persisted; skipping recovery"
+            );
+            return Ok(());
+        }
+
+        let tx_hash_b256 = B256::from(event.tx_hash);
+        let tx = provider
+            .get_transaction_by_hash(tx_hash_b256)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "eth_getTransactionByHash returned None for {}",
+                    hex::encode(event.tx_hash)
+                )
+            })?;
+        let tx_input = tx.input();
+
+        let quote_bytes =
+            crate::quote_recovery::extract_attested_quote_bytes(tx_input, &member_id, &quote_hash)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "setMemberWgPubkeyAttested selector not found in tx {} calldata \
+                 (or all decode candidates mismatched the event bindings)",
+                        hex::encode(event.tx_hash)
+                    )
+                })?;
+
+        // Defense in depth — the contract already enforces this, but a
+        // buggy scan-and-decode that picked up the wrong slice would
+        // otherwise pollute the table with bytes that disagree with the
+        // on-chain commitment.
+        if let Err(actual) =
+            crate::quote_recovery::verify_quote_hash_commitment(&quote_bytes, &quote_hash)
+        {
+            anyhow::bail!(
+                "recovered quote bytes disagree with on-chain quoteHash for member {}: \
+                 expected {} got {}",
+                hex::encode(member_id),
+                hex::encode(quote_hash),
+                hex::encode(actual)
+            );
+        }
+
+        let inserted = self
+            .store
+            .upsert_member_quote(
+                event.contract,
+                member_id,
+                quote_hash,
+                wg_pubkey,
+                &quote_bytes,
+                event.block_number,
+                event.block_hash,
+                event.log_index,
+                event.tx_hash,
+            )
+            .await?;
+
+        if inserted {
+            tracing::info!(
+                chain_id = self.chain_id,
+                cluster = %hex::encode(event.contract),
+                member = %hex::encode(member_id),
+                quote_hash = %hex::encode(quote_hash),
+                quote_len = quote_bytes.len(),
+                block = event.block_number,
+                "persisted MemberWgPubkeySetV2 quote bytes"
+            );
+        }
+
+        // R2 mirror is write-on-write — fire-and-forget after the
+        // authoritative Postgres row is in place. A failed upload is
+        // logged at `warn` but doesn't abort the ingest path: R2 is
+        // availability-only (design §9.2), the row stays correct,
+        // and a future backfill sweep can re-run the upload. Even
+        // when the DB upsert returned `inserted=false` (we're
+        // re-observing a known quote), we still call `put_quote` —
+        // the mirror's idempotence means a re-PUT to the same
+        // content-addressed key is a no-op, and a previous run that
+        // wrote the DB row but crashed before the upload eventually
+        // converges this way.
+        if let Some(mirror) = &self.quote_r2_mirror {
+            match mirror
+                .put_quote(event.contract, member_id, quote_hash, &quote_bytes)
+                .await
+            {
+                Ok(Some(uri)) => {
+                    if let Err(e) = self
+                        .store
+                        .set_member_quote_r2_uri(event.contract, member_id, quote_hash, &uri)
+                        .await
+                    {
+                        tracing::warn!(
+                            chain_id = self.chain_id,
+                            cluster = %hex::encode(event.contract),
+                            member = %hex::encode(member_id),
+                            quote_hash = %hex::encode(quote_hash),
+                            error = %e,
+                            "R2 upload succeeded but persisting r2_uri failed; backfill on next sweep"
+                        );
+                    } else {
+                        tracing::debug!(
+                            chain_id = self.chain_id,
+                            cluster = %hex::encode(event.contract),
+                            member = %hex::encode(member_id),
+                            quote_hash = %hex::encode(quote_hash),
+                            r2_uri = %uri,
+                            "R2 mirror upload complete"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    // Mirror declined to upload (disabled or skipped);
+                    // nothing to record.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        chain_id = self.chain_id,
+                        cluster = %hex::encode(event.contract),
+                        member = %hex::encode(member_id),
+                        quote_hash = %hex::encode(quote_hash),
+                        error = %e,
+                        "R2 mirror upload failed; backfill on next sweep"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Look up the existing `events.id` for an event we tried to
     /// insert but hit the dedup index. Same composite key as the
     /// unique index → single B-tree probe.
@@ -1105,6 +1316,7 @@ pub struct IngestorBuilder {
     views: Vec<Box<dyn View>>,
     finality_depth: Option<u64>,
     notify_tx: Option<mpsc::Sender<NotifyEvent>>,
+    quote_r2_mirror: Option<Arc<dyn crate::r2_mirror::R2QuoteMirror>>,
 }
 
 impl IngestorBuilder {
@@ -1154,6 +1366,19 @@ impl IngestorBuilder {
         self
     }
 
+    /// Plug in an R2 mirror for `MemberWgPubkeySetV2` quote bytes
+    /// (unified-network-design §9.2). The ingestor calls
+    /// [`crate::r2_mirror::R2QuoteMirror::put_quote`] after every
+    /// successful Postgres upsert. A failed upload is logged at
+    /// `warn` and does not fail the DB write — R2 is availability-
+    /// only, not authoritative, so the row stays correct and the
+    /// periodic backfill (see `cluster_member_quotes_pending_r2_idx`)
+    /// retries on the next sweep.
+    pub fn quote_r2_mirror(mut self, mirror: Arc<dyn crate::r2_mirror::R2QuoteMirror>) -> Self {
+        self.quote_r2_mirror = Some(mirror);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<Ingestor> {
         let chain_id = self
             .chain_id
@@ -1188,6 +1413,7 @@ impl IngestorBuilder {
             views: Arc::new(self.views),
             finality_depth,
             notify_tx: self.notify_tx,
+            quote_r2_mirror: self.quote_r2_mirror,
         })
     }
 }

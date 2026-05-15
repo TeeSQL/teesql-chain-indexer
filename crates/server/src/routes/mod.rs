@@ -49,6 +49,7 @@ pub mod factories;
 pub mod health;
 pub mod metrics_route;
 pub mod proof;
+pub mod quotes;
 
 /// Build the public REST router. The caller mounts it at `/`; every
 /// path is namespaced under `/v1/...` already.
@@ -88,6 +89,15 @@ pub fn router(state: Arc<MultiChainState>, metrics: Arc<Metrics>) -> Router {
         .route(
             "/:chain/clusters/:addr/members/:member_id",
             get(clusters::cluster_member),
+        )
+        // Unified-network-design §9.2 — raw TDX quote bytes per member.
+        // Recovered from `setMemberWgPubkeyAttested` tx calldata by the
+        // ingest pipeline; serves binary by default, JSON envelope on
+        // `Accept: application/json`. ETag + immutable cache keyed on
+        // the on-chain `quoteHash` commitment.
+        .route(
+            "/:chain/clusters/:addr/members/:member_id/quote",
+            get(quotes::get_member_quote),
         )
         .route(
             "/:chain/clusters/:addr/lifecycle",

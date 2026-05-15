@@ -88,6 +88,27 @@ pub struct ControlHoleRow {
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// One row of the `cluster_member_quotes` table (unified-network-design
+/// §9.2). Stores the raw TDX quote bytes the chain-indexer recovered
+/// from the `setMemberWgPubkeyAttested` tx calldata for a given
+/// `MemberWgPubkeySetV2` event. Immutable per row — quote bytes never
+/// change for a given `quote_hash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberQuoteRow {
+    pub chain_id: i32,
+    pub cluster_address: [u8; 20],
+    pub member_id: [u8; 32],
+    pub quote_hash: [u8; 32],
+    pub wg_pubkey: [u8; 32],
+    pub quote_bytes: Vec<u8>,
+    pub block_number: u64,
+    pub block_hash: [u8; 32],
+    pub log_index: i32,
+    pub tx_hash: [u8; 32],
+    pub r2_uri: Option<String>,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl EventStore {
     /// Open a store against an already-built pool. Connection details
     /// (RA-TLS, role, credentials) live in `connection.rs`.
@@ -863,6 +884,201 @@ impl EventStore {
         }
         Ok(out)
     }
+
+    /// Insert a `cluster_member_quotes` row for a `MemberWgPubkeySetV2`
+    /// emission. Returns `true` when the row was newly inserted,
+    /// `false` when an identical `(chain_id, cluster_address, member_id,
+    /// quote_hash)` row already existed (idempotent — every quote is
+    /// content-addressed by its keccak256 digest, so a re-observation
+    /// from WS replay / cold-start overlap is a no-op).
+    ///
+    /// The caller MUST verify `keccak256(quote_bytes) == quote_hash`
+    /// before invoking this method. The schema treats stored bytes as
+    /// authoritative for the matching hash; a bad write would only be
+    /// caught the next time a verifier compares against the on-chain
+    /// commitment. Unified-network-design §9.2.
+    ///
+    /// Index used: PK `(chain_id, cluster_address, member_id, quote_hash)`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_member_quote(
+        &self,
+        cluster_address: [u8; 20],
+        member_id: [u8; 32],
+        quote_hash: [u8; 32],
+        wg_pubkey: [u8; 32],
+        quote_bytes: &[u8],
+        block_number: u64,
+        block_hash: [u8; 32],
+        log_index: i32,
+        tx_hash: [u8; 32],
+    ) -> anyhow::Result<bool> {
+        let block_number_i64 = i64::try_from(block_number)
+            .map_err(|_| anyhow::anyhow!("block_number {block_number} overflows i64"))?;
+        // `RETURNING xmax` lets us distinguish "newly inserted" (xmax=0)
+        // from "row already existed" — the latter returns no rows under
+        // `ON CONFLICT DO NOTHING`, so a present row in the result set
+        // is unambiguous evidence of a fresh write. Postgres-specific
+        // but the entire store layer already targets Postgres.
+        let inserted: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO cluster_member_quotes (\
+                 chain_id, cluster_address, member_id, quote_hash, wg_pubkey, \
+                 quote_bytes, block_number, block_hash, log_index, tx_hash\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             ON CONFLICT (chain_id, cluster_address, member_id, quote_hash) DO NOTHING \
+             RETURNING 1",
+        )
+        .bind(self.chain_id)
+        .bind(&cluster_address[..])
+        .bind(&member_id[..])
+        .bind(&quote_hash[..])
+        .bind(&wg_pubkey[..])
+        .bind(quote_bytes)
+        .bind(block_number_i64)
+        .bind(&block_hash[..])
+        .bind(log_index)
+        .bind(&tx_hash[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(inserted.is_some())
+    }
+
+    /// Look up the most recently emitted quote row for a given
+    /// `(cluster_address, member_id)`. "Most recent" is defined by
+    /// canonical chain order: `(block_number DESC, log_index DESC)`.
+    /// Returns `None` when the member has never published an attested
+    /// quote (i.e. no `MemberWgPubkeySetV2` event observed for the
+    /// member yet, or the indexer hasn't recovered the bytes from
+    /// tx calldata).
+    ///
+    /// Used by the REST quote surface at
+    /// `GET /v1/{chain}/clusters/{addr}/members/{id}/quote` (§9.2).
+    /// Always reads the latest row — the route exposes immutable
+    /// cache semantics keyed on `quote_hash`, so callers re-issue with
+    /// `If-None-Match` to detect rotation.
+    ///
+    /// Index used: `cluster_member_quotes_latest_idx
+    /// (chain_id, cluster_address, member_id, block_number DESC,
+    ///  log_index DESC)` — a single index lookup picks the latest row.
+    pub async fn latest_member_quote(
+        &self,
+        cluster_address: [u8; 20],
+        member_id: [u8; 32],
+    ) -> anyhow::Result<Option<MemberQuoteRow>> {
+        let row = sqlx::query(
+            "SELECT chain_id, cluster_address, member_id, quote_hash, wg_pubkey, \
+                    quote_bytes, block_number, block_hash, log_index, tx_hash, \
+                    r2_uri, observed_at \
+             FROM cluster_member_quotes \
+             WHERE chain_id = $1 AND cluster_address = $2 AND member_id = $3 \
+             ORDER BY block_number DESC, log_index DESC \
+             LIMIT 1",
+        )
+        .bind(self.chain_id)
+        .bind(&cluster_address[..])
+        .bind(&member_id[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let row = parse_member_quote_row(row)?;
+        Ok(Some(row))
+    }
+
+    /// Look up a specific historical quote by `(cluster, member, quote_hash)`.
+    /// Used by an integrity recheck path that wants to fetch a quote by
+    /// its content-addressed digest rather than "most recent". Returns
+    /// `None` when no row matches.
+    ///
+    /// Index used: PK `(chain_id, cluster_address, member_id, quote_hash)`.
+    pub async fn member_quote_by_hash(
+        &self,
+        cluster_address: [u8; 20],
+        member_id: [u8; 32],
+        quote_hash: [u8; 32],
+    ) -> anyhow::Result<Option<MemberQuoteRow>> {
+        let row = sqlx::query(
+            "SELECT chain_id, cluster_address, member_id, quote_hash, wg_pubkey, \
+                    quote_bytes, block_number, block_hash, log_index, tx_hash, \
+                    r2_uri, observed_at \
+             FROM cluster_member_quotes \
+             WHERE chain_id = $1 AND cluster_address = $2 \
+               AND member_id = $3 AND quote_hash = $4 \
+             LIMIT 1",
+        )
+        .bind(self.chain_id)
+        .bind(&cluster_address[..])
+        .bind(&member_id[..])
+        .bind(&quote_hash[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(parse_member_quote_row(row)?))
+    }
+
+    /// Record the R2 mirror URI for a previously-persisted quote row.
+    /// Idempotent — overwrites whatever value the row currently holds
+    /// (None or an older URI from a re-upload). Returns true when a
+    /// row matched and was updated; false when no row exists yet for
+    /// the `(cluster, member, quote_hash)` triple.
+    pub async fn set_member_quote_r2_uri(
+        &self,
+        cluster_address: [u8; 20],
+        member_id: [u8; 32],
+        quote_hash: [u8; 32],
+        r2_uri: &str,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE cluster_member_quotes \
+                 SET r2_uri = $5 \
+             WHERE chain_id = $1 AND cluster_address = $2 \
+               AND member_id = $3 AND quote_hash = $4",
+        )
+        .bind(self.chain_id)
+        .bind(&cluster_address[..])
+        .bind(&member_id[..])
+        .bind(&quote_hash[..])
+        .bind(r2_uri)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// Decode a single `cluster_member_quotes` row from the typed sqlx
+/// projection. Centralised here so the latest/by-hash lookup paths
+/// share the bytea-shape validation in one place.
+fn parse_member_quote_row(row: PgRow) -> anyhow::Result<MemberQuoteRow> {
+    let chain_id: i32 = row.try_get("chain_id")?;
+    let cluster_b: Vec<u8> = row.try_get("cluster_address")?;
+    let member_b: Vec<u8> = row.try_get("member_id")?;
+    let quote_hash_b: Vec<u8> = row.try_get("quote_hash")?;
+    let wg_pubkey_b: Vec<u8> = row.try_get("wg_pubkey")?;
+    let quote_bytes: Vec<u8> = row.try_get("quote_bytes")?;
+    let block_number_i64: i64 = row.try_get("block_number")?;
+    let block_hash_b: Vec<u8> = row.try_get("block_hash")?;
+    let log_index: i32 = row.try_get("log_index")?;
+    let tx_hash_b: Vec<u8> = row.try_get("tx_hash")?;
+    let r2_uri: Option<String> = row.try_get("r2_uri")?;
+    let observed_at: chrono::DateTime<chrono::Utc> = row.try_get("observed_at")?;
+    let block_number = u64::try_from(block_number_i64)
+        .map_err(|_| anyhow::anyhow!("cluster_member_quotes.block_number negative"))?;
+    Ok(MemberQuoteRow {
+        chain_id,
+        cluster_address: as_addr(&cluster_b)?,
+        member_id: as_hash(&member_b)?,
+        quote_hash: as_hash(&quote_hash_b)?,
+        wg_pubkey: as_hash(&wg_pubkey_b)?,
+        quote_bytes,
+        block_number,
+        block_hash: as_hash(&block_hash_b)?,
+        log_index,
+        tx_hash: as_hash(&tx_hash_b)?,
+        r2_uri,
+        observed_at,
+    })
 }
 
 /// Convert a Postgres `bytea` payload into a 20-byte address. Returns

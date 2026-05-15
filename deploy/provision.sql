@@ -250,6 +250,64 @@ CREATE INDEX IF NOT EXISTS cluster_compose_hashes_active_idx
     ON cluster_compose_hashes (chain_id, cluster_address)
     WHERE removed_at IS NULL;
 
+-- ---------------------------------------------------------------------------
+-- cluster_member_quotes — raw TDX quote bytes per
+-- `MemberWgPubkeySetV2` admission (unified-network-design §4.1, §9.2).
+--
+-- The `MemberWgPubkeySetV2` event carries only `(memberId, wgPubkey,
+-- quoteHash)`; the raw ~4.5 KB quote is too large for an event log
+-- and is not persisted on chain. The indexer recovers the bytes from
+-- the originating tx calldata (`setMemberWgPubkeyAttested`'s third
+-- argument), verifies `keccak256(tdxQuote) == quoteHash`, and stores
+-- the bytes here so fabric can fetch them through the REST surface
+-- at `GET /v1/{chain}/clusters/{addr}/members/{id}/quote`.
+--
+-- Primary key includes `quote_hash` so a member's same-cluster
+-- rotation (blue-green redeploy mints a new pubkey + quote per
+-- design §6.3) keeps every historical quote retrievable. Fabric
+-- always requests the latest by descending `observed_at`; the table
+-- is content-addressed by `quote_hash` and immutable per row
+-- (`quote_bytes` never changes for a given `quote_hash`).
+--
+-- `r2_uri` is the optional off-chain mirror location set after a
+-- successful upload to the R2 availability mirror (design §9.2:
+-- "R2 is availability-only; verify-by-hash means R2 trust is never
+-- extended"). NULL when the indexer is configured without R2 or
+-- when the upload has not completed yet.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS cluster_member_quotes (
+  chain_id         int NOT NULL,
+  cluster_address  bytea NOT NULL,                 -- 20-byte cluster diamond
+  member_id        bytea NOT NULL,                 -- 32-byte member identity
+  quote_hash       bytea NOT NULL,                 -- 32-byte keccak256(tdxQuote)
+  wg_pubkey        bytea NOT NULL,                 -- 32-byte Curve25519 pubkey from the event
+  quote_bytes      bytea NOT NULL,                 -- raw TDX quote (~4.5 KB)
+  block_number     bigint NOT NULL,                -- emit block of MemberWgPubkeySetV2
+  block_hash       bytea NOT NULL,
+  log_index        int NOT NULL,
+  tx_hash          bytea NOT NULL,                 -- setMemberWgPubkeyAttested tx
+  r2_uri           text,                           -- NULL until R2 mirror upload succeeds
+  observed_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (chain_id, cluster_address, member_id, quote_hash)
+);
+
+-- Latest-quote-per-member lookup. The REST handler answers
+-- `GET .../members/{id}/quote` with the most recently observed row;
+-- ordering by `block_number DESC, log_index DESC` matches canonical
+-- chain order so a replayed older event cannot displace a newer one
+-- by virtue of arriving later in wall-clock time.
+CREATE INDEX IF NOT EXISTS cluster_member_quotes_latest_idx
+    ON cluster_member_quotes
+       (chain_id, cluster_address, member_id, block_number DESC, log_index DESC);
+
+-- R2-mirror backfill index — finds rows that still need an upload.
+-- Partial index keeps the scan tight when the indexer is configured
+-- with the mirror enabled.
+CREATE INDEX IF NOT EXISTS cluster_member_quotes_pending_r2_idx
+    ON cluster_member_quotes (chain_id, observed_at)
+    WHERE r2_uri IS NULL;
+
 CREATE TABLE cluster_lifecycle (
   chain_id         int NOT NULL,
   cluster_address  bytea NOT NULL,

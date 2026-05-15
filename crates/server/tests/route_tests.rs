@@ -392,3 +392,106 @@ fn _broadcast_bus() -> broadcast::Sender<()> {
 fn _server_config_default() -> ServerConfig {
     ServerConfig::default()
 }
+
+// ── /v1/:chain/clusters/:addr/members/:member_id/quote ─────────────
+
+/// Quote route on an unknown chain should 404 cleanly. Mirror of
+/// `unknown_per_chain_route_404s_cleanly` for the V2 admission quote
+/// surface (GAP-W1-003).
+#[tokio::test]
+async fn quote_route_unknown_chain_404s_cleanly() {
+    let state = build_chain_agnostic_state("TEESQL_CI_QUOTE_UNKNOWN_CHAIN").await;
+    let app = build_router(state);
+
+    let uri = format!(
+        "/v1/ethereum/clusters/{}/members/{}/quote",
+        "0x0000000000000000000000000000000000000001",
+        "0x1111111111111111111111111111111111111111111111111111111111111111"
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert!(status.is_client_error(), "expected 4xx, got {}", status);
+    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let body_str = String::from_utf8_lossy(&bytes);
+    // Either an empty body or a JSON error envelope — both valid.
+    assert!(
+        body_str.is_empty()
+            || serde_json::from_str::<Value>(&body_str).is_ok()
+            || body_str.contains("not found")
+            || body_str.contains("unknown"),
+        "expected clean error body, got: {body_str}"
+    );
+}
+
+/// Malformed member_id (not 32 bytes of hex) → 400 with a parse error.
+/// Surfaces the bad-request handling on the quote route specifically;
+/// the underlying parser is shared with `clusters::cluster_member` but
+/// the quote route's contract pins this behavior independently per
+/// spec §15.3.
+#[tokio::test]
+async fn quote_route_rejects_short_member_id() {
+    let state = build_chain_agnostic_state("TEESQL_CI_QUOTE_BAD_MEMBER").await;
+    let app = build_router(state);
+
+    let uri = format!(
+        "/v1/ethereum/clusters/{}/members/{}/quote",
+        "0x0000000000000000000000000000000000000001", "0x1234"
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Either 400 (parsed but invalid) or 404 (unknown chain hit first
+    // due to per-chain resolver) — both are clean client errors. We
+    // care that it's not a 500.
+    let status = resp.status();
+    assert!(
+        status.is_client_error(),
+        "expected 4xx for malformed member_id, got {}",
+        status
+    );
+}
+
+/// Malformed cluster address → 400. Pinned because the path layer
+/// uses alloy's address parser, and a regression there would silently
+/// 500.
+#[tokio::test]
+async fn quote_route_rejects_bad_cluster_address() {
+    let state = build_chain_agnostic_state("TEESQL_CI_QUOTE_BAD_ADDR").await;
+    let app = build_router(state);
+
+    let uri = format!(
+        "/v1/ethereum/clusters/{}/members/{}/quote",
+        "not-an-address", "0x1111111111111111111111111111111111111111111111111111111111111111"
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "expected 4xx for malformed address, got {}",
+        resp.status()
+    );
+}
