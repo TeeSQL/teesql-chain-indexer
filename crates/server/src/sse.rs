@@ -8,6 +8,19 @@
 //! REST companion documented in spec §7.3 returns the same row
 //! wrapped in the standard signed envelope.
 //!
+//! Wire envelope per `network-architecture-unified.md §9.1` carries
+//! `id`, `block_number`, `log_index`, `tx_hash`, `kind`, `decoded`,
+//! `removed`, and `as_of`. `removed` is the reorg-rollback flag
+//! propagated verbatim from the `events` row — fabric uses it to
+//! evict cached admissions whose underlying chain commitment has
+//! been rolled back, instead of waiting for the next 10-minute
+//! RPC audit (§8). `as_of` carries the indexer's
+//! `{finalized_block, block_timestamp, ...}` cursor so consumers
+//! can run the §5.4 freshness gate
+//! (`head_block - as_of.finalized_block <= LAG_MAX`, `now -
+//! as_of.block_timestamp <= AGE_MAX`) on every admission-critical
+//! frame without an extra REST round-trip.
+//!
 //! The handler builds a stream of `axum::response::sse::Event` frames
 //! that combines two sources:
 //!
@@ -15,7 +28,9 @@
 //!    last_seen` matching the per-connection filter is read out of
 //!    Postgres in id order and emitted as an SSE frame. This catches
 //!    consumers up after a reconnect (`Last-Event-ID` header) or a
-//!    cold start (`?since=<id>`).
+//!    cold start (`?since=<id>`). Reorged rows (`removed = true`)
+//!    are included in the replay stream so a reconnecting consumer
+//!    learns about rollbacks that landed during the disconnect.
 //!
 //! 2. **Live** — once replay drains, the handler subscribes to a
 //!    `tokio::sync::broadcast::Receiver<NotifyEvent>` held by
@@ -54,11 +69,13 @@ use sqlx::Row;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::as_of::{self, AsOf, Safety};
 use crate::error::ApiError;
 use crate::routes::clusters::ClusterPath;
 use crate::routes::events::parse_kinds;
 use crate::state::MultiChainState;
 use teesql_chain_indexer_core::ingest::{ControlNotifyEvent, NotifyEvent};
+use teesql_chain_indexer_core::store::EventStore;
 
 /// Per-connection recent-event-id cache used to deduplicate frames
 /// when the same `event_id` arrives via more than one path on the
@@ -129,6 +146,7 @@ pub async fn sse_handler(
         kinds: Arc::new(kinds),
     };
 
+    let store = app.store.clone();
     let pool = app.store.pool().clone();
     let chain_id = app.store.chain_id();
     let live_rx = app.sse_tx.subscribe();
@@ -136,19 +154,28 @@ pub async fn sse_handler(
     let stream = async_stream::stream! {
         let mut last_id = since;
         let mut recent = RecentIds::new();
+        // Snapshot the indexer's `as_of` cursor and refresh it
+        // alongside each backlog chunk / live frame. Cold-start
+        // failure is non-fatal: frames emit with `as_of: null` so
+        // consumers can fail-closed on admission paths while still
+        // receiving the event coordinates.
+        let mut cached_as_of: Option<AsOf> = snapshot_as_of(&store).await;
 
         // ---- 1. Replay backlog ----
         loop {
             match read_backlog(&pool, chain_id, &filter, last_id, 500).await {
                 Ok(rows) if rows.is_empty() => break,
                 Ok(rows) => {
+                    if let Some(fresh) = snapshot_as_of(&store).await {
+                        cached_as_of = Some(fresh);
+                    }
                     for row in rows {
                         let id = row.id;
                         if !recent.observe(id) {
                             continue;
                         }
                         last_id = id;
-                        let value = serialize_event_row(&row);
+                        let value = serialize_event_row(&row, cached_as_of.as_ref());
                         match build_event_frame(id, &value) {
                             Ok(frame) => yield Ok::<Event, Infallible>(frame),
                             Err(e) => {
@@ -186,7 +213,10 @@ pub async fn sse_handler(
                         Ok(Some(row)) => {
                             let id = row.id;
                             last_id = id;
-                            let value = serialize_event_row(&row);
+                            if let Some(fresh) = snapshot_as_of(&store).await {
+                                cached_as_of = Some(fresh);
+                            }
+                            let value = serialize_event_row(&row, cached_as_of.as_ref());
                             match build_event_frame(id, &value) {
                                 Ok(frame) => yield Ok::<Event, Infallible>(frame),
                                 Err(e) => {
@@ -195,8 +225,8 @@ pub async fn sse_handler(
                             }
                         }
                         Ok(None) => {
-                            // Notify arrived but the row is gone (reorg
-                            // rolled it back as `removed=true`). Skip.
+                            // Notify arrived but no row matches the
+                            // SSE filter (cluster scope). Skip.
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "SSE live row fetch failed");
@@ -209,13 +239,16 @@ pub async fn sse_handler(
                     // and resume the live tail with the same receiver.
                     match read_backlog(&pool, chain_id, &filter, last_id, 500).await {
                         Ok(rows) => {
+                            if let Some(fresh) = snapshot_as_of(&store).await {
+                                cached_as_of = Some(fresh);
+                            }
                             for row in rows {
                                 let id = row.id;
                                 if !recent.observe(id) {
                                     continue;
                                 }
                                 last_id = id;
-                                let value = serialize_event_row(&row);
+                                let value = serialize_event_row(&row, cached_as_of.as_ref());
                                 if let Ok(frame) = build_event_frame(id, &value) {
                                     yield Ok::<Event, Infallible>(frame);
                                 }
@@ -263,6 +296,7 @@ struct EventRow {
     tx_hash: Vec<u8>,
     decoded_kind: Option<String>,
     decoded: Option<Value>,
+    removed: bool,
 }
 
 async fn read_backlog(
@@ -273,12 +307,14 @@ async fn read_backlog(
     limit: i64,
 ) -> Result<Vec<EventRow>, ApiError> {
     let kinds: Vec<String> = filter.kinds.as_ref().clone();
+    // `removed = true` rows are forwarded so fabric can react to
+    // reorgs without waiting for the next 10-minute RPC audit
+    // (`network-architecture-unified.md §9.1`).
     let rows = sqlx::query(
-        "SELECT id, block_number, log_index, tx_hash, decoded_kind, decoded
+        "SELECT id, block_number, log_index, tx_hash, decoded_kind, decoded, removed
          FROM events
          WHERE chain_id = $1
            AND contract = $2
-           AND removed = false
            AND id > $3
            AND ($4::text[] = '{}' OR decoded_kind = ANY($4))
          ORDER BY id
@@ -302,6 +338,7 @@ async fn read_backlog(
             tx_hash: row.try_get("tx_hash").map_err(ApiError::from)?,
             decoded_kind: row.try_get("decoded_kind").map_err(ApiError::from)?,
             decoded: row.try_get("decoded").map_err(ApiError::from)?,
+            removed: row.try_get("removed").map_err(ApiError::from)?,
         });
     }
     Ok(out)
@@ -313,10 +350,13 @@ async fn read_row_by_id(
     filter: &SseFilter,
     id: i64,
 ) -> Result<Option<EventRow>, ApiError> {
+    // No `removed = false` filter — reorged rows are forwarded with
+    // `removed: true` so live consumers see rollbacks as the live
+    // notify or replay surfaces them.
     let row = sqlx::query(
-        "SELECT id, block_number, log_index, tx_hash, decoded_kind, decoded
+        "SELECT id, block_number, log_index, tx_hash, decoded_kind, decoded, removed
          FROM events
-         WHERE chain_id = $1 AND id = $2 AND contract = $3 AND removed = false",
+         WHERE chain_id = $1 AND id = $2 AND contract = $3",
     )
     .bind(chain_id)
     .bind(id)
@@ -332,10 +372,32 @@ async fn read_row_by_id(
         tx_hash: row.try_get("tx_hash").map_err(ApiError::from)?,
         decoded_kind: row.try_get("decoded_kind").map_err(ApiError::from)?,
         decoded: row.try_get("decoded").map_err(ApiError::from)?,
+        removed: row.try_get("removed").map_err(ApiError::from)?,
     }))
 }
 
-fn serialize_event_row(row: &EventRow) -> Value {
+/// Snapshot the indexer's finalized cursor for inclusion in SSE
+/// frames. Maps to the §5.4 freshness gate: consumers compute
+/// `head_block - as_of.finalized_block <= LAG_MAX` and
+/// `now - as_of.block_timestamp <= AGE_MAX` to decide whether the
+/// indexer's view of chain state is fresh enough for admission.
+///
+/// Returns `None` on cold start (no blocks ingested yet) or any
+/// transient resolver failure. The handler embeds `as_of: null`
+/// in that case so consumers can fail-closed on admission paths
+/// while still seeing the event coordinates.
+async fn snapshot_as_of(store: &EventStore) -> Option<AsOf> {
+    match as_of::resolve(store, Safety::Finalized, None).await {
+        Ok(a) => Some(a),
+        Err(e) => {
+            tracing::debug!(error = %e, "SSE as_of snapshot unavailable; emitting as_of=null");
+            None
+        }
+    }
+}
+
+fn serialize_event_row(row: &EventRow, as_of: Option<&AsOf>) -> Value {
+    let as_of_value = as_of.map(AsOf::to_json).unwrap_or(Value::Null);
     json!({
         "id": row.id,
         "block_number": row.block_number,
@@ -343,6 +405,8 @@ fn serialize_event_row(row: &EventRow) -> Value {
         "tx_hash": format!("0x{}", hex::encode(&row.tx_hash)),
         "kind": row.decoded_kind,
         "decoded": row.decoded,
+        "removed": row.removed,
+        "as_of": as_of_value,
     })
 }
 
@@ -498,5 +562,156 @@ mod tests {
         assert!(!r.observe(0), "0 is still in the window");
         assert!(r.observe(RecentIds::CAP as i64), "fresh id pushes past cap");
         assert!(r.observe(0), "0 was evicted; re-observing emits");
+    }
+
+    fn sample_row(removed: bool, kind: &str) -> EventRow {
+        EventRow {
+            id: 17,
+            block_number: 45_491_234,
+            log_index: 3,
+            tx_hash: vec![0xab; 32],
+            decoded_kind: Some(kind.to_string()),
+            decoded: Some(json!({"memberId": "0x01", "wgPubkey": "0x02"})),
+            removed,
+        }
+    }
+
+    fn sample_as_of() -> AsOf {
+        AsOf {
+            block_number: 45_491_222,
+            block_hash: "0x".to_string() + &"cd".repeat(32),
+            block_timestamp: 1_777_771_500,
+            finalized_block: 45_491_222,
+            safety: Safety::Finalized,
+        }
+    }
+
+    /// Per `network-architecture-unified.md §9.1`, every admission-
+    /// critical SSE frame must carry `id`, `block_number`, `log_index`,
+    /// `tx_hash`, `kind`, `decoded`, `removed`, and `as_of`. Missing
+    /// any of these in the serialized envelope is a contract break.
+    #[test]
+    fn serialize_event_row_emits_admission_critical_keys() {
+        let row = sample_row(false, "MemberWgPubkeySetV2");
+        let as_of = sample_as_of();
+        let v = serialize_event_row(&row, Some(&as_of));
+        let obj = v.as_object().expect("envelope is an object");
+        for key in [
+            "id",
+            "block_number",
+            "log_index",
+            "tx_hash",
+            "kind",
+            "decoded",
+            "removed",
+            "as_of",
+        ] {
+            assert!(obj.contains_key(key), "envelope missing key `{key}`");
+        }
+        assert_eq!(obj["id"].as_i64(), Some(17));
+        assert_eq!(obj["block_number"].as_i64(), Some(45_491_234));
+        assert_eq!(obj["log_index"].as_i64(), Some(3));
+        assert_eq!(
+            obj["tx_hash"].as_str(),
+            Some(format!("0x{}", "ab".repeat(32)).as_str())
+        );
+        assert_eq!(obj["kind"].as_str(), Some("MemberWgPubkeySetV2"));
+        assert_eq!(obj["removed"].as_bool(), Some(false));
+    }
+
+    /// Reorged rows survive server-side filtering and reach the
+    /// consumer with `removed: true` so fabric can evict cached
+    /// admissions without waiting for the §8 10-minute RPC audit.
+    #[test]
+    fn serialize_event_row_forwards_removed_true() {
+        let row = sample_row(true, "MemberWgPubkeySetV2");
+        let v = serialize_event_row(&row, Some(&sample_as_of()));
+        assert_eq!(
+            v["removed"].as_bool(),
+            Some(true),
+            "removed=true must be forwarded verbatim, not filtered"
+        );
+    }
+
+    /// `as_of` carries the indexer's `finalized_block` +
+    /// `block_timestamp` cursor so consumers can run the §5.4
+    /// freshness gate (`head_block - as_of.finalized_block <= 24`,
+    /// `now - as_of.block_timestamp <= 300`) on every frame.
+    #[test]
+    fn serialize_event_row_attaches_as_of_freshness_fields() {
+        let row = sample_row(false, "MemberWgPubkeySetV2");
+        let as_of = sample_as_of();
+        let v = serialize_event_row(&row, Some(&as_of));
+        let as_of_obj = v
+            .get("as_of")
+            .and_then(Value::as_object)
+            .expect("as_of present as object");
+        assert_eq!(
+            as_of_obj["finalized_block"].as_u64(),
+            Some(45_491_222),
+            "freshness gate needs finalized_block"
+        );
+        assert_eq!(
+            as_of_obj["block_timestamp"].as_u64(),
+            Some(1_777_771_500),
+            "freshness gate needs block_timestamp"
+        );
+    }
+
+    /// Cold-start path: until the indexer has finalized a block we
+    /// emit `as_of: null` rather than dropping the event. Consumers
+    /// fail-closed on admission paths but still see the coordinates.
+    #[test]
+    fn serialize_event_row_emits_null_as_of_on_cold_start() {
+        let row = sample_row(false, "ComposeHashAllowed");
+        let v = serialize_event_row(&row, None);
+        assert!(
+            v.get("as_of").is_some_and(Value::is_null),
+            "as_of must be present as JSON null when snapshot is unavailable"
+        );
+        assert_eq!(v["kind"].as_str(), Some("ComposeHashAllowed"));
+    }
+
+    /// The serializer is kind-agnostic — each V2 event kind round-
+    /// trips through the envelope verbatim, since the SSE layer
+    /// reads `events.decoded_kind` straight from the row written by
+    /// the W1-002 V2 decoders.
+    #[test]
+    fn serialize_event_row_carries_v2_event_kinds() {
+        let as_of = sample_as_of();
+        for kind in [
+            "MemberWgPubkeySetV2",
+            "ComposeHashAllowed",
+            "ComposeHashRemoved",
+            "TcbDegraded",
+        ] {
+            let row = sample_row(false, kind);
+            let v = serialize_event_row(&row, Some(&as_of));
+            assert_eq!(
+                v["kind"].as_str(),
+                Some(kind),
+                "{kind} must be forwarded as-is"
+            );
+        }
+    }
+
+    /// The SQL filter accepts the V2 kinds CSV without parser-side
+    /// rejection. (Wire-shape regression check; the query itself
+    /// runs against Postgres in integration tests.)
+    #[test]
+    fn parse_kinds_accepts_v2_event_kinds() {
+        let parsed = parse_kinds(Some(
+            "MemberWgPubkeySetV2,ComposeHashAllowed,ComposeHashRemoved,TcbDegraded",
+        ))
+        .expect("non-empty kind list parses");
+        assert_eq!(
+            parsed,
+            vec![
+                "MemberWgPubkeySetV2".to_string(),
+                "ComposeHashAllowed".to_string(),
+                "ComposeHashRemoved".to_string(),
+                "TcbDegraded".to_string(),
+            ]
+        );
     }
 }
