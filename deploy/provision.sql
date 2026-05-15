@@ -135,10 +135,25 @@ CREATE TABLE cluster_members (
   dns_label        text,
   public_endpoint  text,
   -- WireGuard pubkey hex (lowercase 64-char Curve25519, no 0x prefix).
-  -- Populated by `MemberWgPubkeySet` events emitted by WgMeshFacet
+  -- Populated by V1 `MemberWgPubkeySet` events emitted by WgMeshFacet
   -- (Phase 1 fabric cross-boundary). NULL until the member's first
   -- publish; fabric defers admission until non-NULL.
   wg_pubkey_hex    text,
+  -- V2 admission columns per unified-network-design §4.1. Populated by
+  -- `MemberWgPubkeySetV2` and tracked alongside (not in place of)
+  -- `wg_pubkey_hex` so a cluster mid-cutover surfaces both — fabric
+  -- prefers V2 when present, but pre-cutover clusters keep working
+  -- through the V1 column. NULL until the member's first attested
+  -- publish.
+  wg_pubkey        bytea,                      -- 32-byte raw Curve25519
+  quote_hash       bytea,                      -- keccak256(tdxQuote)
+  -- Latest `TcbDegraded` alert per unified-network-design §6.3 / §7.
+  -- `tcb_severity` is a uint8 enum (1 = warn, 2 = critical at design
+  -- time; smallint leaves room for the contract surface to expand).
+  -- The pair is "current alert snapshot, not audit trail"; the full
+  -- history lives in the events log.
+  tcb_severity     smallint,
+  tcb_degraded_at  bigint,                     -- block timestamp of the latest event
   registered_at    bigint,                     -- block timestamp
   retired_at       bigint,                     -- NULL = active
   updated_at       timestamptz NOT NULL DEFAULT now(),
@@ -151,6 +166,52 @@ CREATE TABLE cluster_members (
 -- defines it; on an upgraded DB it bolts the column on without
 -- losing the existing roster.
 ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS wg_pubkey_hex text;
+-- Idempotent backfill of the V2 admission columns + TCB alert pair
+-- on clusters provisioned before the unified-network-design landed.
+-- Same `ADD COLUMN IF NOT EXISTS` pattern as the wg_pubkey_hex
+-- backfill above: no-op on a fresh DB; safe upgrade on an existing
+-- one. Surfacing them as nullables preserves the pre-V2 roster
+-- shape — fabric's V1 path keeps reading `wg_pubkey_hex` until the
+-- contract cuts over.
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS wg_pubkey bytea;
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS quote_hash bytea;
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS tcb_severity smallint;
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS tcb_degraded_at bigint;
+
+-- ---------------------------------------------------------------------------
+-- cluster_compose_hashes — MRTD allowlist materialization driven by
+-- `ComposeHashAllowed` / `ComposeHashRemoved`
+-- (unified-network-design §4.2).
+--
+-- One row per `(chain_id, cluster_address, compose_hash)`. `allowed_at`
+-- and `removed_at` are block timestamps; the row's "live" state is
+-- `allowed_at IS NOT NULL AND removed_at IS NULL`. A re-add after a
+-- removal flips `removed_at` back to NULL — fabric reads the row as
+-- a current-state snapshot, not a sticky history (the full audit
+-- trail lives in the events log).
+--
+-- `allowed_at`/`removed_at` are nullable independently so an
+-- out-of-order replay that delivers a removal before the matching
+-- add still records the removal — the materializer fills the
+-- missing half on subsequent ingest.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS cluster_compose_hashes (
+  chain_id         int NOT NULL,
+  cluster_address  bytea NOT NULL,
+  compose_hash     bytea NOT NULL,             -- 32-byte keccak256(compose YAML)
+  allowed_at       bigint,                     -- block timestamp of the most recent allow
+  removed_at       bigint,                     -- NULL = currently allowed
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (chain_id, cluster_address, compose_hash)
+);
+
+-- Index optimised for fabric's "list currently-active hashes" probe.
+-- Partial index excludes removed rows so the scan footprint stays
+-- proportional to live allowlist size (single digits in practice).
+CREATE INDEX IF NOT EXISTS cluster_compose_hashes_active_idx
+    ON cluster_compose_hashes (chain_id, cluster_address)
+    WHERE removed_at IS NULL;
 
 CREATE TABLE cluster_lifecycle (
   chain_id         int NOT NULL,

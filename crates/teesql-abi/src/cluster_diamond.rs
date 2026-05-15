@@ -19,6 +19,20 @@
 //! - `ControlAck(bytes32, bytes32, bytes32, uint8, uint64, bytes32, bytes)`
 //! - `MemberWgPubkeySet(bytes32, string)` — fabric mesh WG pubkey registry
 //!   (Phase 1 of fabric cross-boundary; source: WgMeshFacet.sol)
+//! - `MemberWgPubkeySetV2(bytes32, bytes32, bytes32)` — attested admission
+//!   event for the unified network design (`docs/designs/network-architecture-unified.md`
+//!   §4.1, §9.1). Carries the raw 32-byte WG pubkey alongside a
+//!   `quoteHash = keccak256(tdxQuote)` commitment.
+//! - `ComposeHashAllowed(bytes32)` / `ComposeHashRemoved(bytes32)` —
+//!   MRTD allowlist mutations (`AdminFacet`, source: IAdmin.sol §§4.2).
+//!   Note: `composeHash` is NOT indexed on the contract side per
+//!   IAdmin.sol L12-13; the decoder reflects the wire layout the
+//!   contracts actually emit.
+//! - `TcbDegraded(bytes32, uint8)` — periodic re-verify alert
+//!   (`docs/designs/network-architecture-unified.md` §6.3, §7).
+//!   Alert-only — fabric does not auto-evict. Bound here ahead of the
+//!   on-chain emit so the indexer is ready when the contract surface
+//!   ships the event.
 //!
 //! `EndpointUpdated`, `OnboardingPosted`, `MemberPassthroughCreated`,
 //! and `InstanceBindingVerified` exist on the diamond but are out of
@@ -92,6 +106,39 @@ sol! {
         /// indexer's materialized `cluster_members.wg_pubkey_hex` column
         /// + SSE stream to discover peers and bring up wg0.
         event MemberWgPubkeySet(bytes32 indexed memberId, string wgPubkeyHex);
+
+        /// V2 attested admission event per unified-network-design §4.1:
+        /// `setMemberWgPubkeyAttested` validates a TDX quote on-chain
+        /// and emits this event carrying the raw `wgPubkey` plus
+        /// `quoteHash = keccak256(tdxQuote)`. Fabric verifies
+        /// `keccak256(retrievedQuote) == quoteHash` before extending
+        /// trust, so substituting a quote requires a hash collision.
+        event MemberWgPubkeySetV2(
+            bytes32 indexed memberId,
+            bytes32 wgPubkey,
+            bytes32 quoteHash
+        );
+
+        /// Compose-hash allowlist add (unified-network-design §4.2).
+        /// `composeHash` is NOT indexed in `IAdmin.sol` (line 12) — the
+        /// contract emits the bytes32 in the data slot, so the decoder
+        /// must mirror that layout.
+        event ComposeHashAllowed(bytes32 composeHash);
+
+        /// Compose-hash allowlist remove (unified-network-design §4.2).
+        /// Non-indexed for the same reason as `ComposeHashAllowed`.
+        /// Fabric invalidates cached PASS verdicts whose `mrtd ==
+        /// composeHash` on observing this event.
+        event ComposeHashRemoved(bytes32 composeHash);
+
+        /// Periodic TCB re-verify alert (unified-network-design §6.3,
+        /// §7). Alert-only signal — fabric records the severity but
+        /// does not auto-evict. Hard eviction is Safe-signed.
+        ///
+        /// Severity is a `uint8` enum tracked in the design doc:
+        ///   1 = warn      (e.g. UpToDate → ConfigurationNeeded)
+        ///   2 = critical  (e.g. * → Revoked)
+        event TcbDegraded(bytes32 indexed memberId, uint8 severity);
     }
 }
 
@@ -343,6 +390,130 @@ impl Decoder for MemberWgPubkeySetDecoder {
             "wgPubkeyHex":  decoded.wgPubkeyHex.clone(),
             "_topic0":      bytes32_to_json(&IClusterDiamond::MemberWgPubkeySet::SIGNATURE_HASH),
             "_signature":   IClusterDiamond::MemberWgPubkeySet::SIGNATURE,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemberWgPubkeySetV2
+//
+// Source: unified-network-design §4.1 + §5. Carries `wgPubkey` as raw
+// 32-byte Curve25519 + `quoteHash = keccak256(tdxQuote)`. Coexists with
+// the V1 `MemberWgPubkeySet` decoder: V1 ships a hex-string pubkey,
+// V2 ships raw bytes32 + a quote-hash commitment. Fabric prefers V2 if
+// both are present for the same member, but the indexer treats them as
+// independent event streams — neither subsumes the other in the
+// materialized table because they describe different trust layers.
+// ---------------------------------------------------------------------------
+
+pub struct MemberWgPubkeySetV2Decoder;
+
+impl Decoder for MemberWgPubkeySetV2Decoder {
+    fn topic0(&self) -> [u8; 32] {
+        IClusterDiamond::MemberWgPubkeySetV2::SIGNATURE_HASH.0
+    }
+
+    fn kind(&self) -> &'static str {
+        "MemberWgPubkeySetV2"
+    }
+
+    fn decode(&self, log: &Log) -> anyhow::Result<Value> {
+        let decoded = IClusterDiamond::MemberWgPubkeySetV2::decode_log(&log.inner)
+            .context("decode MemberWgPubkeySetV2 log")?;
+        Ok(json!({
+            "memberId":   bytes32_to_json(&decoded.memberId),
+            "wgPubkey":   bytes32_to_json(&decoded.wgPubkey),
+            "quoteHash":  bytes32_to_json(&decoded.quoteHash),
+            "_topic0":    bytes32_to_json(&IClusterDiamond::MemberWgPubkeySetV2::SIGNATURE_HASH),
+            "_signature": IClusterDiamond::MemberWgPubkeySetV2::SIGNATURE,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ComposeHashAllowed / ComposeHashRemoved
+//
+// Source: IAdmin.sol §§4.2. Both non-indexed on the contract side
+// (the keccak256 cost of `indexed bytes32` on a frequently-mutated
+// allowlist wasn't worth the topic-filter convenience), so the
+// composeHash field arrives in the data slot. Fabric subscribes to
+// the pair and treats `Allowed` as monotonic-add and `Removed` as
+// monotonic-remove; replaying the full event history reconstructs
+// the live allowlist.
+// ---------------------------------------------------------------------------
+
+pub struct ComposeHashAllowedDecoder;
+
+impl Decoder for ComposeHashAllowedDecoder {
+    fn topic0(&self) -> [u8; 32] {
+        IClusterDiamond::ComposeHashAllowed::SIGNATURE_HASH.0
+    }
+
+    fn kind(&self) -> &'static str {
+        "ComposeHashAllowed"
+    }
+
+    fn decode(&self, log: &Log) -> anyhow::Result<Value> {
+        let decoded = IClusterDiamond::ComposeHashAllowed::decode_log(&log.inner)
+            .context("decode ComposeHashAllowed log")?;
+        Ok(json!({
+            "composeHash": bytes32_to_json(&decoded.composeHash),
+            "_topic0":     bytes32_to_json(&IClusterDiamond::ComposeHashAllowed::SIGNATURE_HASH),
+            "_signature":  IClusterDiamond::ComposeHashAllowed::SIGNATURE,
+        }))
+    }
+}
+
+pub struct ComposeHashRemovedDecoder;
+
+impl Decoder for ComposeHashRemovedDecoder {
+    fn topic0(&self) -> [u8; 32] {
+        IClusterDiamond::ComposeHashRemoved::SIGNATURE_HASH.0
+    }
+
+    fn kind(&self) -> &'static str {
+        "ComposeHashRemoved"
+    }
+
+    fn decode(&self, log: &Log) -> anyhow::Result<Value> {
+        let decoded = IClusterDiamond::ComposeHashRemoved::decode_log(&log.inner)
+            .context("decode ComposeHashRemoved log")?;
+        Ok(json!({
+            "composeHash": bytes32_to_json(&decoded.composeHash),
+            "_topic0":     bytes32_to_json(&IClusterDiamond::ComposeHashRemoved::SIGNATURE_HASH),
+            "_signature":  IClusterDiamond::ComposeHashRemoved::SIGNATURE,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TcbDegraded
+//
+// Source: unified-network-design §6.3 / §7. Emitted on periodic
+// re-verify when a member's TCB status drops out of the policy
+// envelope. Alert signal only — fabric tracks the latest severity
+// per member but does not auto-evict.
+// ---------------------------------------------------------------------------
+
+pub struct TcbDegradedDecoder;
+
+impl Decoder for TcbDegradedDecoder {
+    fn topic0(&self) -> [u8; 32] {
+        IClusterDiamond::TcbDegraded::SIGNATURE_HASH.0
+    }
+
+    fn kind(&self) -> &'static str {
+        "TcbDegraded"
+    }
+
+    fn decode(&self, log: &Log) -> anyhow::Result<Value> {
+        let decoded = IClusterDiamond::TcbDegraded::decode_log(&log.inner)
+            .context("decode TcbDegraded log")?;
+        Ok(json!({
+            "memberId":   bytes32_to_json(&decoded.memberId),
+            "severity":   uint8_to_json(decoded.severity),
+            "_topic0":    bytes32_to_json(&IClusterDiamond::TcbDegraded::SIGNATURE_HASH),
+            "_signature": IClusterDiamond::TcbDegraded::SIGNATURE,
         }))
     }
 }

@@ -12,9 +12,10 @@ pub mod factory;
 pub use teesql_chain_indexer_core::decode::Decoder;
 
 use cluster_diamond::{
-    ClusterDestroyedDecoder, ControlAckDecoder, ControlInstructionBroadcastDecoder,
-    LeaderClaimedDecoder, MemberRegisteredDecoder, MemberRetiredDecoder, MemberWgPubkeySetDecoder,
-    PublicEndpointUpdatedDecoder,
+    ClusterDestroyedDecoder, ComposeHashAllowedDecoder, ComposeHashRemovedDecoder,
+    ControlAckDecoder, ControlInstructionBroadcastDecoder, LeaderClaimedDecoder,
+    MemberRegisteredDecoder, MemberRetiredDecoder, MemberWgPubkeySetDecoder,
+    MemberWgPubkeySetV2Decoder, PublicEndpointUpdatedDecoder, TcbDegradedDecoder,
 };
 use factory::ClusterDeployedDecoder;
 
@@ -37,6 +38,10 @@ pub fn all_decoders() -> Vec<Box<dyn Decoder>> {
         Box::new(ControlInstructionBroadcastDecoder),
         Box::new(ControlAckDecoder),
         Box::new(MemberWgPubkeySetDecoder),
+        Box::new(MemberWgPubkeySetV2Decoder),
+        Box::new(ComposeHashAllowedDecoder),
+        Box::new(ComposeHashRemovedDecoder),
+        Box::new(TcbDegradedDecoder),
     ]
 }
 
@@ -64,10 +69,11 @@ mod tests {
     #[test]
     fn all_decoders_count_matches_spec() {
         // 1 factory event + 5 lifecycle/membership cluster-diamond
-        // events + 2 control-plane events + 1 WG-mesh fabric event
-        // = 9 decoders. Phase 1 of fabric cross-boundary added
-        // MemberWgPubkeySet alongside the existing pairs.
-        assert_eq!(all_decoders().len(), 9);
+        // events + 2 control-plane events + 1 V1 WG-mesh event +
+        // 4 unified-network-design V2 events (MemberWgPubkeySetV2,
+        // ComposeHashAllowed, ComposeHashRemoved, TcbDegraded)
+        // = 13 decoders.
+        assert_eq!(all_decoders().len(), 13);
     }
 
     /// Pin `MemberWgPubkeySet` decoder presence so a future
@@ -98,5 +104,24 @@ mod tests {
             kinds.contains(&"ControlAck"),
             "all_decoders() must register ControlAck: {kinds:?}"
         );
+    }
+
+    /// Pin the unified-network-design V2 decoders so a regression
+    /// that drops any of them surfaces here rather than as silent
+    /// missing rows in fabric's admission cache + allowlist views.
+    #[test]
+    fn all_decoders_includes_v2_unified_network_set() {
+        let kinds: Vec<&'static str> = all_decoders().iter().map(|d| d.kind()).collect();
+        for expected in [
+            "MemberWgPubkeySetV2",
+            "ComposeHashAllowed",
+            "ComposeHashRemoved",
+            "TcbDegraded",
+        ] {
+            assert!(
+                kinds.contains(&expected),
+                "all_decoders() must register {expected}: {kinds:?}"
+            );
+        }
     }
 }

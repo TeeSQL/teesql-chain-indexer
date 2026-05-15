@@ -51,6 +51,10 @@ pub mod endpoint {
     pub const LEADER: &str = "leader";
     pub const MEMBERS: &str = "members";
     pub const LIFECYCLE: &str = "lifecycle";
+    /// Materialized MRTD allowlist driven by
+    /// `ComposeHashAllowed` / `ComposeHashRemoved`
+    /// (unified-network-design §4.2).
+    pub const COMPOSE_HASHES: &str = "compose_hashes";
 }
 
 pub async fn cluster_overview(
@@ -188,6 +192,34 @@ pub async fn cluster_lifecycle(
         Some(cache),
         move |app, as_of, _common| async move {
             run_view(&app, endpoint::LIFECYCLE, cluster, as_of.block_number).await
+        },
+    )
+    .await?;
+    Ok(Json(env))
+}
+
+/// Per unified-network-design §4.2: surfaces the MRTD allowlist as
+/// reconstructed from `ComposeHashAllowed` / `ComposeHashRemoved`.
+/// Fabric's audit path (§8) reads this view alongside direct-RPC
+/// state to detect indexer suppression of allowlist mutations.
+pub async fn cluster_compose_hashes(
+    State(state): State<Arc<MultiChainState>>,
+    Path(p): Path<ClusterPath>,
+    Query(raw): Query<RawQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let cluster = parse_address(&p.addr)?;
+    let common = raw.parse()?;
+    let cache = CacheKey {
+        cluster,
+        endpoint: endpoint::COMPOSE_HASHES,
+    };
+    let env = build_signed(
+        &state,
+        &p.chain,
+        common,
+        Some(cache),
+        move |app, as_of, _common| async move {
+            run_view(&app, endpoint::COMPOSE_HASHES, cluster, as_of.block_number).await
         },
     )
     .await?;
