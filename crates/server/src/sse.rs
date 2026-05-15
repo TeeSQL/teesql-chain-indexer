@@ -154,28 +154,26 @@ pub async fn sse_handler(
     let stream = async_stream::stream! {
         let mut last_id = since;
         let mut recent = RecentIds::new();
-        // Snapshot the indexer's `as_of` cursor and refresh it
-        // alongside each backlog chunk / live frame. Cold-start
-        // failure is non-fatal: frames emit with `as_of: null` so
-        // consumers can fail-closed on admission paths while still
-        // receiving the event coordinates.
-        let mut cached_as_of: Option<AsOf> = snapshot_as_of(&store).await;
 
         // ---- 1. Replay backlog ----
         loop {
             match read_backlog(&pool, chain_id, &filter, last_id, 500).await {
                 Ok(rows) if rows.is_empty() => break,
                 Ok(rows) => {
-                    if let Some(fresh) = snapshot_as_of(&store).await {
-                        cached_as_of = Some(fresh);
-                    }
                     for row in rows {
                         let id = row.id;
                         if !recent.observe(id) {
                             continue;
                         }
                         last_id = id;
-                        let value = serialize_event_row(&row, cached_as_of.as_ref());
+                        // Per-frame freshness: re-resolve `as_of` for
+                        // every emission so a transient resolver
+                        // failure surfaces as `as_of: null` rather than
+                        // a stale cursor. The §5.4 fabric admission
+                        // gate fails closed on null but would silently
+                        // accept a stale snapshot.
+                        let as_of = snapshot_as_of(&store).await;
+                        let value = serialize_event_row(&row, as_of.as_ref());
                         match build_event_frame(id, &value) {
                             Ok(frame) => yield Ok::<Event, Infallible>(frame),
                             Err(e) => {
@@ -213,10 +211,8 @@ pub async fn sse_handler(
                         Ok(Some(row)) => {
                             let id = row.id;
                             last_id = id;
-                            if let Some(fresh) = snapshot_as_of(&store).await {
-                                cached_as_of = Some(fresh);
-                            }
-                            let value = serialize_event_row(&row, cached_as_of.as_ref());
+                            let as_of = snapshot_as_of(&store).await;
+                            let value = serialize_event_row(&row, as_of.as_ref());
                             match build_event_frame(id, &value) {
                                 Ok(frame) => yield Ok::<Event, Infallible>(frame),
                                 Err(e) => {
@@ -239,16 +235,14 @@ pub async fn sse_handler(
                     // and resume the live tail with the same receiver.
                     match read_backlog(&pool, chain_id, &filter, last_id, 500).await {
                         Ok(rows) => {
-                            if let Some(fresh) = snapshot_as_of(&store).await {
-                                cached_as_of = Some(fresh);
-                            }
                             for row in rows {
                                 let id = row.id;
                                 if !recent.observe(id) {
                                     continue;
                                 }
                                 last_id = id;
-                                let value = serialize_event_row(&row, cached_as_of.as_ref());
+                                let as_of = snapshot_as_of(&store).await;
+                                let value = serialize_event_row(&row, as_of.as_ref());
                                 if let Ok(frame) = build_event_frame(id, &value) {
                                     yield Ok::<Event, Infallible>(frame);
                                 }
@@ -633,10 +627,12 @@ mod tests {
         );
     }
 
-    /// `as_of` carries the indexer's `finalized_block` +
-    /// `block_timestamp` cursor so consumers can run the §5.4
-    /// freshness gate (`head_block - as_of.finalized_block <= 24`,
-    /// `now - as_of.block_timestamp <= 300`) on every frame.
+    /// `as_of` carries the full `{block_number, block_hash,
+    /// block_timestamp, finalized_block, safety}` cursor so consumers
+    /// can run the §5.4 freshness gate (`head_block -
+    /// as_of.finalized_block <= 24`, `now - as_of.block_timestamp <=
+    /// 300`) and tie the frame to a specific canonical chain head.
+    /// Missing any of the five sub-fields is a §9.1 contract break.
     #[test]
     fn serialize_event_row_attaches_as_of_freshness_fields() {
         let row = sample_row(false, "MemberWgPubkeySetV2");
@@ -647,14 +643,29 @@ mod tests {
             .and_then(Value::as_object)
             .expect("as_of present as object");
         assert_eq!(
-            as_of_obj["finalized_block"].as_u64(),
+            as_of_obj["block_number"].as_u64(),
             Some(45_491_222),
-            "freshness gate needs finalized_block"
+            "as_of must carry block_number for chain-head pinning"
+        );
+        assert_eq!(
+            as_of_obj["block_hash"].as_str(),
+            Some(format!("0x{}", "cd".repeat(32)).as_str()),
+            "as_of must carry block_hash so consumers can resolve reorg ties"
         );
         assert_eq!(
             as_of_obj["block_timestamp"].as_u64(),
             Some(1_777_771_500),
             "freshness gate needs block_timestamp"
+        );
+        assert_eq!(
+            as_of_obj["finalized_block"].as_u64(),
+            Some(45_491_222),
+            "freshness gate needs finalized_block"
+        );
+        assert_eq!(
+            as_of_obj["safety"].as_str(),
+            Some("finalized"),
+            "as_of must declare its safety tier so consumers can reject head-of-chain reads"
         );
     }
 
