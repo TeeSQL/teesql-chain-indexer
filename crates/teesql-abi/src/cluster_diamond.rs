@@ -28,6 +28,13 @@
 //!   Note: `composeHash` is NOT indexed on the contract side per
 //!   IAdmin.sol L12-13; the decoder reflects the wire layout the
 //!   contracts actually emit.
+//! - `ComposeHashAdded(bytes32)` — legacy synonym of
+//!   `ComposeHashAllowed`. Source: `IAppAuthBasicManagement.sol`
+//!   (mirrored from dstack's auth-eth contracts). The W0-001 rename
+//!   replaced this event with `ComposeHashAllowed` on the TeeSQL
+//!   AdminFacet; the legacy decoder stays registered so the indexer
+//!   can decode historical events emitted before the rename
+//!   (clusters mid-cutover, vanilla dstack apps).
 //! - `TcbDegraded(bytes32, uint8)` — periodic re-verify alert
 //!   (`docs/designs/network-architecture-unified.md` §6.3, §7).
 //!   Alert-only — fabric does not auto-evict. Bound here ahead of the
@@ -124,6 +131,17 @@ sol! {
         /// contract emits the bytes32 in the data slot, so the decoder
         /// must mirror that layout.
         event ComposeHashAllowed(bytes32 composeHash);
+
+        /// Legacy synonym of `ComposeHashAllowed` (source:
+        /// `IAppAuthBasicManagement.sol` line 13, mirrored from
+        /// dstack's auth-eth contracts). The W0-001 rename replaced
+        /// this event with `ComposeHashAllowed` on the TeeSQL
+        /// AdminFacet; the legacy decoder is registered so the
+        /// indexer can pick up historical events emitted before the
+        /// rename. Wire layout is identical to `ComposeHashAllowed`,
+        /// and the `cluster_compose_hashes` materializer routes both
+        /// to the same apply path.
+        event ComposeHashAdded(bytes32 composeHash);
 
         /// Compose-hash allowlist remove (unified-network-design §4.2).
         /// Non-indexed for the same reason as `ComposeHashAllowed`.
@@ -460,6 +478,38 @@ impl Decoder for ComposeHashAllowedDecoder {
             "composeHash": bytes32_to_json(&decoded.composeHash),
             "_topic0":     bytes32_to_json(&IClusterDiamond::ComposeHashAllowed::SIGNATURE_HASH),
             "_signature":  IClusterDiamond::ComposeHashAllowed::SIGNATURE,
+        }))
+    }
+}
+
+/// Legacy `ComposeHashAdded(bytes32)` decoder. Emits the SAME JSON
+/// shape as `ComposeHashAllowedDecoder` (single `composeHash` field
+/// plus the diagnostic `_topic0` / `_signature` envelope), but
+/// `kind()` returns `"ComposeHashAdded"` so the persisted
+/// `events.decoded_kind` faithfully records what the contract
+/// actually emitted. The `cluster_compose_hashes` materializer
+/// routes both kinds through `apply_compose_hash_allowed` so the
+/// materialized state is correct across the rename boundary —
+/// historical events from before the rename are observable to
+/// fabric without an extra backfill step.
+pub struct ComposeHashAddedDecoder;
+
+impl Decoder for ComposeHashAddedDecoder {
+    fn topic0(&self) -> [u8; 32] {
+        IClusterDiamond::ComposeHashAdded::SIGNATURE_HASH.0
+    }
+
+    fn kind(&self) -> &'static str {
+        "ComposeHashAdded"
+    }
+
+    fn decode(&self, log: &Log) -> anyhow::Result<Value> {
+        let decoded = IClusterDiamond::ComposeHashAdded::decode_log(&log.inner)
+            .context("decode ComposeHashAdded log")?;
+        Ok(json!({
+            "composeHash": bytes32_to_json(&decoded.composeHash),
+            "_topic0":     bytes32_to_json(&IClusterDiamond::ComposeHashAdded::SIGNATURE_HASH),
+            "_signature":  IClusterDiamond::ComposeHashAdded::SIGNATURE,
         }))
     }
 }

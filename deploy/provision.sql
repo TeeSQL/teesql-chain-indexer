@@ -147,6 +147,13 @@ CREATE TABLE cluster_members (
   -- publish.
   wg_pubkey        bytea,                      -- 32-byte raw Curve25519
   quote_hash       bytea,                      -- keccak256(tdxQuote)
+  -- Event coordinates of the most recent V2 publish applied to
+  -- `wg_pubkey` / `quote_hash`. Compared as a tuple against incoming
+  -- events so a stale `MemberWgPubkeySetV2` re-delivered after a
+  -- rotation cannot revert the row to the older pubkey. NULL until
+  -- the first V2 event is observed.
+  wg_pubkey_v2_block      bigint,
+  wg_pubkey_v2_log_index  int,
   -- Latest `TcbDegraded` alert per unified-network-design §6.3 / §7.
   -- `tcb_severity` is a uint8 enum (1 = warn, 2 = critical at design
   -- time; smallint leaves room for the contract surface to expand).
@@ -154,6 +161,11 @@ CREATE TABLE cluster_members (
   -- history lives in the events log.
   tcb_severity     smallint,
   tcb_degraded_at  bigint,                     -- block timestamp of the latest event
+  -- Event coordinates of the most recent `TcbDegraded` applied to
+  -- `tcb_severity` / `tcb_degraded_at`. Same purpose as the V2 pair
+  -- above: a stale duplicate cannot overwrite a newer severity.
+  tcb_event_block      bigint,
+  tcb_event_log_index  int,
   registered_at    bigint,                     -- block timestamp
   retired_at       bigint,                     -- NULL = active
   updated_at       timestamptz NOT NULL DEFAULT now(),
@@ -177,6 +189,14 @@ ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS wg_pubkey bytea;
 ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS quote_hash bytea;
 ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS tcb_severity smallint;
 ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS tcb_degraded_at bigint;
+-- Backfill the per-event-source coordinate columns introduced by
+-- W1-002 follow-up (stale-replay-cannot-revert). NULL on existing
+-- rows is treated as "no prior event observed" by the materializer's
+-- comparison logic, so the first post-upgrade event always wins.
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS wg_pubkey_v2_block bigint;
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS wg_pubkey_v2_log_index int;
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS tcb_event_block bigint;
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS tcb_event_log_index int;
 
 -- ---------------------------------------------------------------------------
 -- cluster_compose_hashes — MRTD allowlist materialization driven by
@@ -202,9 +222,26 @@ CREATE TABLE IF NOT EXISTS cluster_compose_hashes (
   compose_hash     bytea NOT NULL,             -- 32-byte keccak256(compose YAML)
   allowed_at       bigint,                     -- block timestamp of the most recent allow
   removed_at       bigint,                     -- NULL = currently allowed
+  -- Event coordinates of the most recent allow/remove applied to the
+  -- row. Compared as a `(block_number, log_index)` tuple against
+  -- incoming events so a stale duplicate `ComposeHashAllowed` (e.g.
+  -- WS replay of an earlier allow that has since been superseded by
+  -- `ComposeHashRemoved`) cannot clear `removed_at` and re-activate
+  -- a revoked MRTD. NULL until the first event is observed.
+  last_event_block      bigint,
+  last_event_log_index  int,
   updated_at       timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (chain_id, cluster_address, compose_hash)
 );
+
+-- Backfill of the event-coordinate columns introduced by the W1-002
+-- follow-up (stale-replay-cannot-reactivate). NULL on existing rows
+-- is treated as "no prior event observed" by the materializer's
+-- comparison logic, so the first post-upgrade event always wins.
+ALTER TABLE cluster_compose_hashes
+    ADD COLUMN IF NOT EXISTS last_event_block bigint;
+ALTER TABLE cluster_compose_hashes
+    ADD COLUMN IF NOT EXISTS last_event_log_index int;
 
 -- Index optimised for fabric's "list currently-active hashes" probe.
 -- Partial index excludes removed rows so the scan footprint stays

@@ -26,12 +26,19 @@
 //!   `wg_pubkey` (raw 32-byte) and `quote_hash`. V1 and V2 are
 //!   tracked independently so a regression that disables V2 on the
 //!   contract side doesn't silently clobber V1 fabric admission, and
-//!   vice versa.
+//!   vice versa. The V2 columns travel with a `(block_number,
+//!   log_index)` coordinate pair (`wg_pubkey_v2_block`,
+//!   `wg_pubkey_v2_log_index`) so a stale duplicate event
+//!   re-delivered after a rotation cannot revert the row to the
+//!   older pubkey.
 //!
 //! - `TcbDegraded` (unified-network-design §6.3) writes
 //!   `tcb_severity` + `tcb_degraded_at`. The latest event wins —
 //!   fabric reads the column as a "current alert level" snapshot;
-//!   the full audit trail lives in the events log.
+//!   the full audit trail lives in the events log. Latest-event
+//!   selection uses the same `(block_number, log_index)`
+//!   coordinate-tuple comparison as the V2 path, so a re-delivered
+//!   older severity cannot overwrite a newer one.
 //!
 //! Block timestamps for `registered_at` / `retired_at` come from the
 //! `blocks` row keyed by `(chain_id, block_number)`. The blocks row
@@ -267,14 +274,50 @@ async fn apply_member_wg_pubkey_set_v2(store: &EventStore, event: &DecodedEvent)
     let member_id = decoded::member_id(payload, "memberId")?;
     let wg_pubkey = decoded::member_id(payload, "wgPubkey")?;
     let quote_hash = decoded::member_id(payload, "quoteHash")?;
+    let event_block = i64::try_from(event.block_number).context("block_number overflows i64")?;
+    let event_log_index = event.log_index;
 
+    // Tuple comparison gates the `wg_pubkey` / `quote_hash` update on
+    // the incoming event being strictly newer than the most-recent V2
+    // event already applied to the row. A duplicate stale
+    // `MemberWgPubkeySetV2` re-delivered after a rotation must not
+    // revert the row to the older pubkey. `COALESCE(..., -1)` treats
+    // NULL stored coordinates (pre-migration row, or no V2 event
+    // observed yet) as "always older" so the first V2 event wins.
     let row = sqlx::query(
         "INSERT INTO cluster_members \
-            (chain_id, cluster_address, member_id, wg_pubkey, quote_hash) \
-         VALUES ($1, $2, $3, $4, $5) \
+            (chain_id, cluster_address, member_id, wg_pubkey, quote_hash, \
+             wg_pubkey_v2_block, wg_pubkey_v2_log_index) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (chain_id, cluster_address, member_id) DO UPDATE SET \
-             wg_pubkey  = EXCLUDED.wg_pubkey, \
-             quote_hash = EXCLUDED.quote_hash, \
+             wg_pubkey  = CASE \
+                 WHEN (EXCLUDED.wg_pubkey_v2_block, EXCLUDED.wg_pubkey_v2_log_index) \
+                    > (COALESCE(cluster_members.wg_pubkey_v2_block, -1), \
+                       COALESCE(cluster_members.wg_pubkey_v2_log_index, -1)) \
+                 THEN EXCLUDED.wg_pubkey \
+                 ELSE cluster_members.wg_pubkey \
+             END, \
+             quote_hash = CASE \
+                 WHEN (EXCLUDED.wg_pubkey_v2_block, EXCLUDED.wg_pubkey_v2_log_index) \
+                    > (COALESCE(cluster_members.wg_pubkey_v2_block, -1), \
+                       COALESCE(cluster_members.wg_pubkey_v2_log_index, -1)) \
+                 THEN EXCLUDED.quote_hash \
+                 ELSE cluster_members.quote_hash \
+             END, \
+             wg_pubkey_v2_block = CASE \
+                 WHEN (EXCLUDED.wg_pubkey_v2_block, EXCLUDED.wg_pubkey_v2_log_index) \
+                    > (COALESCE(cluster_members.wg_pubkey_v2_block, -1), \
+                       COALESCE(cluster_members.wg_pubkey_v2_log_index, -1)) \
+                 THEN EXCLUDED.wg_pubkey_v2_block \
+                 ELSE cluster_members.wg_pubkey_v2_block \
+             END, \
+             wg_pubkey_v2_log_index = CASE \
+                 WHEN (EXCLUDED.wg_pubkey_v2_block, EXCLUDED.wg_pubkey_v2_log_index) \
+                    > (COALESCE(cluster_members.wg_pubkey_v2_block, -1), \
+                       COALESCE(cluster_members.wg_pubkey_v2_log_index, -1)) \
+                 THEN EXCLUDED.wg_pubkey_v2_log_index \
+                 ELSE cluster_members.wg_pubkey_v2_log_index \
+             END, \
              updated_at = now() \
          RETURNING (xmax = 0) AS inserted",
     )
@@ -283,6 +326,8 @@ async fn apply_member_wg_pubkey_set_v2(store: &EventStore, event: &DecodedEvent)
     .bind(&member_id[..])
     .bind(&wg_pubkey[..])
     .bind(&quote_hash[..])
+    .bind(event_block)
+    .bind(event_log_index)
     .fetch_one(store.pool())
     .await
     .context("upsert wg_pubkey + quote_hash for MemberWgPubkeySetV2")?;
@@ -311,14 +356,49 @@ async fn apply_tcb_degraded(store: &EventStore, event: &DecodedEvent) -> Result<
     // smallint, which trivially holds a u8.
     let severity_i16 = i16::from(decoded::uint8(payload, "severity")?);
     let block_ts = lookup_block_ts(store, event.chain_id, event.block_number).await?;
+    let event_block = i64::try_from(event.block_number).context("block_number overflows i64")?;
+    let event_log_index = event.log_index;
 
+    // Mirror-symmetric to the V2 apply path: `tcb_severity` /
+    // `tcb_degraded_at` only update when the incoming event is
+    // strictly newer than the most-recent TCB event already
+    // applied. A stale `TcbDegraded(warn)` re-delivered after a
+    // `TcbDegraded(critical)` must not roll the column back to the
+    // less-severe value.
     let row = sqlx::query(
         "INSERT INTO cluster_members \
-            (chain_id, cluster_address, member_id, tcb_severity, tcb_degraded_at) \
-         VALUES ($1, $2, $3, $4, $5) \
+            (chain_id, cluster_address, member_id, tcb_severity, tcb_degraded_at, \
+             tcb_event_block, tcb_event_log_index) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (chain_id, cluster_address, member_id) DO UPDATE SET \
-             tcb_severity    = EXCLUDED.tcb_severity, \
-             tcb_degraded_at = EXCLUDED.tcb_degraded_at, \
+             tcb_severity    = CASE \
+                 WHEN (EXCLUDED.tcb_event_block, EXCLUDED.tcb_event_log_index) \
+                    > (COALESCE(cluster_members.tcb_event_block, -1), \
+                       COALESCE(cluster_members.tcb_event_log_index, -1)) \
+                 THEN EXCLUDED.tcb_severity \
+                 ELSE cluster_members.tcb_severity \
+             END, \
+             tcb_degraded_at = CASE \
+                 WHEN (EXCLUDED.tcb_event_block, EXCLUDED.tcb_event_log_index) \
+                    > (COALESCE(cluster_members.tcb_event_block, -1), \
+                       COALESCE(cluster_members.tcb_event_log_index, -1)) \
+                 THEN EXCLUDED.tcb_degraded_at \
+                 ELSE cluster_members.tcb_degraded_at \
+             END, \
+             tcb_event_block = CASE \
+                 WHEN (EXCLUDED.tcb_event_block, EXCLUDED.tcb_event_log_index) \
+                    > (COALESCE(cluster_members.tcb_event_block, -1), \
+                       COALESCE(cluster_members.tcb_event_log_index, -1)) \
+                 THEN EXCLUDED.tcb_event_block \
+                 ELSE cluster_members.tcb_event_block \
+             END, \
+             tcb_event_log_index = CASE \
+                 WHEN (EXCLUDED.tcb_event_block, EXCLUDED.tcb_event_log_index) \
+                    > (COALESCE(cluster_members.tcb_event_block, -1), \
+                       COALESCE(cluster_members.tcb_event_log_index, -1)) \
+                 THEN EXCLUDED.tcb_event_log_index \
+                 ELSE cluster_members.tcb_event_log_index \
+             END, \
              updated_at      = now() \
          RETURNING (xmax = 0) AS inserted",
     )
@@ -327,6 +407,8 @@ async fn apply_tcb_degraded(store: &EventStore, event: &DecodedEvent) -> Result<
     .bind(&member_id[..])
     .bind(severity_i16)
     .bind(block_ts)
+    .bind(event_block)
+    .bind(event_log_index)
     .fetch_one(store.pool())
     .await
     .context("upsert tcb_severity + tcb_degraded_at for TcbDegraded")?;
@@ -429,6 +511,12 @@ struct MemberRow {
     /// Fabric verifies `keccak256(retrievedQuote) == quoteHash`
     /// before extending trust.
     quote_hash: Option<[u8; 32]>,
+    /// `(block_number, log_index)` of the most-recent
+    /// `MemberWgPubkeySetV2` event applied. Compared before any
+    /// update to `wg_pubkey` / `quote_hash` so a stale duplicate
+    /// re-delivered after a rotation cannot revert the row to the
+    /// older pubkey.
+    last_v2_event: Option<(u64, i32)>,
     /// Latest `TcbDegraded` severity for this member (1 = warn,
     /// 2 = critical per design §6.3). NULL means "no degradation
     /// observed yet" — fabric treats the field as a current snapshot,
@@ -436,6 +524,11 @@ struct MemberRow {
     tcb_severity: Option<i64>,
     /// Block timestamp of the most recent `TcbDegraded` event.
     tcb_degraded_at: Option<i64>,
+    /// `(block_number, log_index)` of the most-recent `TcbDegraded`
+    /// event applied. Gates updates to `tcb_severity` /
+    /// `tcb_degraded_at` so a re-delivered older severity cannot
+    /// overwrite a newer one.
+    last_tcb_event: Option<(u64, i32)>,
     registered_at: Option<i64>,
     retired_at: Option<i64>,
 }
@@ -549,10 +642,23 @@ pub fn replay_in_memory(
                 let member_id = decoded::member_id(payload, "memberId")?;
                 let wg_pubkey = decoded::member_id(payload, "wgPubkey")?;
                 let quote_hash = decoded::member_id(payload, "quoteHash")?;
+                let incoming_coord = (event.block_number, event.log_index);
                 let existed = members.contains_key(&member_id);
                 let row = members.entry(member_id).or_default();
-                row.wg_pubkey = Some(wg_pubkey);
-                row.quote_hash = Some(quote_hash);
+                // Strict tuple comparison gates the V2 columns:
+                // only an event strictly newer than the most-recent
+                // V2 event already applied to the row overwrites
+                // `wg_pubkey` / `quote_hash`. A stale duplicate
+                // re-delivered after a rotation is a no-op.
+                let is_newer = match row.last_v2_event {
+                    Some(prev) => incoming_coord > prev,
+                    None => true,
+                };
+                if is_newer {
+                    row.wg_pubkey = Some(wg_pubkey);
+                    row.quote_hash = Some(quote_hash);
+                    row.last_v2_event = Some(incoming_coord);
+                }
                 if !existed {
                     warn!(
                         chain_id = event.chain_id,
@@ -564,10 +670,21 @@ pub fn replay_in_memory(
             Some("TcbDegraded") => {
                 let member_id = decoded::member_id(payload, "memberId")?;
                 let severity = decoded::uint8(payload, "severity")?;
+                let incoming_coord = (event.block_number, event.log_index);
                 let existed = members.contains_key(&member_id);
                 let row = members.entry(member_id).or_default();
-                row.tcb_severity = Some(i64::from(severity));
-                row.tcb_degraded_at = ts;
+                // Same stale-replay gate as the V2 path above. A
+                // re-delivered older severity must not overwrite a
+                // newer one.
+                let is_newer = match row.last_tcb_event {
+                    Some(prev) => incoming_coord > prev,
+                    None => true,
+                };
+                if is_newer {
+                    row.tcb_severity = Some(i64::from(severity));
+                    row.tcb_degraded_at = ts;
+                    row.last_tcb_event = Some(incoming_coord);
+                }
                 if !existed {
                     warn!(
                         chain_id = event.chain_id,
