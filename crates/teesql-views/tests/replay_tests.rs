@@ -240,7 +240,156 @@ fn members_replay_member_registered_populates_row() {
     assert_eq!(m["dnsLabel"], "alpha");
     assert_eq!(m["registeredAt"], 1_700_000_000_i64);
     assert!(m["publicEndpoint"].is_null());
+    assert!(m["wgEndpoint"].is_null());
     assert!(m["retiredAt"].is_null());
+}
+
+#[test]
+fn members_replay_public_endpoint_derives_wg_endpoint_for_phala_url() {
+    // GAP-W1-005: a parseable Phala-gateway publicEndpoint must
+    // populate `wgEndpoint` with the explicit `<id>-51820.<node>:443`
+    // uotcp target so fabric never has to parse the URL.
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(150u64, 1_700_000_500_i64);
+
+    let url =
+        "https://abcdef0123456789abcdef0123456789abcdef01-5432.dstack-base-prod5.phala.network";
+    let url_hex = format!("0x{}", hex::encode(url));
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            150,
+            0,
+            "PublicEndpointUpdated",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "publicEndpoint": url_hex,
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["publicEndpoint"], url);
+    assert_eq!(
+        m["wgEndpoint"],
+        "abcdef0123456789abcdef0123456789abcdef01-51820.dstack-base-prod5.phala.network:443"
+    );
+}
+
+#[test]
+fn members_replay_public_endpoint_unparseable_leaves_wg_endpoint_null() {
+    // GAP-W1-005: an unparseable publicEndpoint preserves the URL on
+    // `publicEndpoint` (legacy contract) but leaves `wgEndpoint` NULL
+    // — fabric must explicitly defer admission rather than guess.
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(150u64, 1_700_000_500_i64);
+
+    // A bare `host.tld` URL with no `<id>-<port>` label segment is
+    // unparseable for the Phala-gateway uotcp derivation.
+    let url = "https://abc.phala.network";
+    let url_hex = format!("0x{}", hex::encode(url));
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            150,
+            0,
+            "PublicEndpointUpdated",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "publicEndpoint": url_hex,
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["publicEndpoint"], url);
+    assert!(
+        m["wgEndpoint"].is_null(),
+        "unparseable publicEndpoint must leave wgEndpoint NULL, got {:?}",
+        m["wgEndpoint"]
+    );
+}
+
+#[test]
+fn members_replay_public_endpoint_rotates_wg_endpoint_on_resubmit() {
+    // A second `PublicEndpointUpdated` (e.g. blue-green redeploy
+    // moves the data-sidecar to a different gateway port) must
+    // overwrite `wgEndpoint` to the latest derivation; old endpoint
+    // must NOT linger.
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(150u64, 1_700_000_500_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+
+    let old_url =
+        "https://1111111111111111111111111111111111111111-5432.dstack-base-prod5.phala.network";
+    let new_url =
+        "https://2222222222222222222222222222222222222222-5432.dstack-base-prod4.phala.network";
+    let old_hex = format!("0x{}", hex::encode(old_url));
+    let new_hex = format!("0x{}", hex::encode(new_url));
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            150,
+            0,
+            "PublicEndpointUpdated",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "publicEndpoint": old_hex,
+            }),
+        ),
+        event(
+            200,
+            0,
+            "PublicEndpointUpdated",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "publicEndpoint": new_hex,
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["publicEndpoint"], new_url);
+    assert_eq!(
+        m["wgEndpoint"],
+        "2222222222222222222222222222222222222222-51820.dstack-base-prod4.phala.network:443"
+    );
 }
 
 #[test]
