@@ -9,11 +9,13 @@
 //! HTTP API. Replay is purely additive: it only reads from `events`
 //! and `blocks`, never from the materialized tables.
 //!
+pub mod compose_hashes;
 pub mod decoded;
 pub mod leader;
 pub mod lifecycle;
 pub mod members;
 
+pub use compose_hashes::ComposeHashesView;
 pub use leader::LeaderView;
 pub use lifecycle::LifecycleView;
 pub use members::MembersView;
@@ -28,6 +30,7 @@ pub fn all_views() -> Vec<Box<dyn View>> {
         Box::new(LeaderView::new()),
         Box::new(MembersView::new()),
         Box::new(LifecycleView::new()),
+        Box::new(ComposeHashesView::new()),
     ]
 }
 

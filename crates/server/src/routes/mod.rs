@@ -97,6 +97,10 @@ pub fn router(state: Arc<MultiChainState>, metrics: Arc<Metrics>) -> Router {
             "/:chain/clusters/:addr/lifecycle/proof",
             get(proof::cluster_lifecycle_proof),
         )
+        .route(
+            "/:chain/clusters/:addr/compose-hashes",
+            get(clusters::cluster_compose_hashes),
+        )
         .route("/:chain/clusters/:addr/events", get(events::list_events))
         .route("/:chain/clusters/:addr/events/sse", get(events::sse_events))
         // Verification companion to bare SSE frames (spec §7.3): a

@@ -96,8 +96,12 @@ fn kinds_for_endpoint(endpoint: &str) -> Vec<&'static str> {
             "MemberRetired",
             "InstanceIdUpdated",
             "PublicEndpointUpdated",
+            "MemberWgPubkeySet",
+            "MemberWgPubkeySetV2",
+            "TcbDegraded",
         ],
         endpoint::LIFECYCLE => vec!["ClusterDestroyed"],
+        endpoint::COMPOSE_HASHES => vec!["ComposeHashAllowed", "ComposeHashRemoved"],
         _ => vec![],
     }
 }

@@ -23,6 +23,9 @@ pub enum DecodeError {
     #[error("field `{0}` is not a JSON string")]
     NotString(&'static str),
 
+    #[error("field `{0}` is not a JSON number")]
+    NotNumber(&'static str),
+
     #[error("invalid hex in field `{field}`: {source}")]
     Hex {
         field: &'static str,
@@ -42,6 +45,9 @@ pub enum DecodeError {
 
     #[error("integer in field `{field}` overflows i64: {value}")]
     Overflow { field: &'static str, value: String },
+
+    #[error("integer in field `{field}` out of u8 range: {value}")]
+    U8OutOfRange { field: &'static str, value: u64 },
 }
 
 /// Pull a JSON string out by key.
@@ -150,6 +156,22 @@ pub fn bytes_as_utf8_text(
     Ok(match String::from_utf8(raw.clone()) {
         Ok(text) => Ok(text),
         Err(_) => Err(format!("0x{}", hex::encode(&raw))),
+    })
+}
+
+/// `uint8` JSON field → `u8`. The decoder's `uint8_to_json` emits a
+/// JSON Number (not a string), which is safe because `u8::MAX = 255`
+/// fits trivially in f64. Used by the `TcbDegraded.severity`
+/// materializer (unified-network-design §6.3).
+pub fn uint8(v: &serde_json::Value, key: &'static str) -> Result<u8, DecodeError> {
+    let n = v
+        .get(key)
+        .ok_or(DecodeError::MissingField(key))?
+        .as_u64()
+        .ok_or(DecodeError::NotNumber(key))?;
+    u8::try_from(n).map_err(|_| DecodeError::U8OutOfRange {
+        field: key,
+        value: n,
     })
 }
 

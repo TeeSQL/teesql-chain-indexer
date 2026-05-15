@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use serde_json::json;
-use teesql_chain_indexer_views::{leader, lifecycle, members, DecodedEvent};
+use teesql_chain_indexer_views::{compose_hashes, leader, lifecycle, members, DecodedEvent};
 
 const CHAIN_ID: i32 = 8453;
 const CLUSTER: [u8; 20] = [
@@ -635,6 +635,473 @@ fn members_replay_two_members_independent_state() {
     assert_eq!(arr[0]["retiredAt"], 1_700_005_000_i64);
     assert_eq!(arr[1]["dnsLabel"], "beta");
     assert!(arr[1]["retiredAt"].is_null());
+}
+
+// ---------------------------------------------------------------------------
+// MembersView — V2 admission + TCB degraded path
+// (unified-network-design §4.1, §6.3)
+// ---------------------------------------------------------------------------
+
+fn bytes32_str(byte: u8) -> String {
+    let mut bytes = [0u8; 32];
+    bytes.fill(byte);
+    format!("0x{}", hex::encode(bytes))
+}
+
+#[test]
+fn members_replay_member_wg_pubkey_set_v2_populates_attested_columns() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+
+    let wg_pubkey = bytes32_str(0x11);
+    let quote_hash = bytes32_str(0x22);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            200,
+            0,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": wg_pubkey.clone(),
+                "quoteHash": quote_hash.clone(),
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["wgPubkey"], wg_pubkey);
+    assert_eq!(m["quoteHash"], quote_hash);
+    assert_eq!(m["dnsLabel"], "alpha");
+    // V1 column stays NULL: the materializer treats V1 and V2 as
+    // independent trust layers.
+    assert!(m["wgPubkeyHex"].is_null());
+}
+
+#[test]
+fn members_replay_member_wg_pubkey_set_v2_before_register_creates_stub() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+
+    let wg_pubkey = bytes32_str(0x33);
+    let quote_hash = bytes32_str(0x44);
+
+    let events = vec![event(
+        100,
+        0,
+        "MemberWgPubkeySetV2",
+        json!({
+            "memberId": member_id_str(0xa1),
+            "wgPubkey": wg_pubkey.clone(),
+            "quoteHash": quote_hash.clone(),
+        }),
+    )];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["wgPubkey"], wg_pubkey);
+    assert_eq!(m["quoteHash"], quote_hash);
+    assert!(m["dnsLabel"].is_null());
+    assert!(m["registeredAt"].is_null());
+}
+
+#[test]
+fn members_replay_member_wg_pubkey_set_v2_rotation_keeps_latest_quote_hash() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let pubkey_old = bytes32_str(0x55);
+    let pubkey_new = bytes32_str(0x66);
+    let quote_old = bytes32_str(0x77);
+    let quote_new = bytes32_str(0x88);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            200,
+            0,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": pubkey_old,
+                "quoteHash": quote_old,
+            }),
+        ),
+        event(
+            300,
+            0,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": pubkey_new.clone(),
+                "quoteHash": quote_new.clone(),
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["wgPubkey"], pubkey_new);
+    assert_eq!(m["quoteHash"], quote_new);
+}
+
+/// Duplicate `MemberWgPubkeySetV2` events (WS replay / HA double-write)
+/// must be idempotent in the replay path — the second occurrence
+/// converges to the same final row, not a stub-creating warning.
+#[test]
+fn members_replay_member_wg_pubkey_set_v2_duplicate_is_idempotent() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+
+    let wg_pubkey = bytes32_str(0xaa);
+    let quote_hash = bytes32_str(0xbb);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            200,
+            0,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": wg_pubkey.clone(),
+                "quoteHash": quote_hash.clone(),
+            }),
+        ),
+        // Same wire payload — emulates a WS replay re-delivering the
+        // event after a steady-state subscriber already saw it.
+        event(
+            200,
+            0,
+            "MemberWgPubkeySetV2",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "wgPubkey": wg_pubkey.clone(),
+                "quoteHash": quote_hash.clone(),
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let arr = result["members"].as_array().unwrap();
+    assert_eq!(arr.len(), 1, "duplicate must not create a second row");
+    assert_eq!(arr[0]["wgPubkey"], wg_pubkey);
+    assert_eq!(arr[0]["quoteHash"], quote_hash);
+}
+
+#[test]
+fn members_replay_tcb_degraded_stamps_severity_and_block_ts() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            300,
+            0,
+            "TcbDegraded",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "severity": 2,
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["tcbSeverity"], 2);
+    assert_eq!(m["tcbDegradedAt"], 1_700_002_000_i64);
+}
+
+/// Latest-event-wins: a `TcbDegraded(warn)` followed by
+/// `TcbDegraded(critical)` from a later block leaves the row at
+/// critical. Fabric reads the column as a current snapshot, not a
+/// max-severity history (see materializer doc).
+#[test]
+fn members_replay_tcb_degraded_latest_event_wins() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "MemberRegistered",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "instanceId": address_str(0x10),
+                "passthrough": address_str(0x20),
+                "dnsLabel": "alpha",
+            }),
+        ),
+        event(
+            200,
+            0,
+            "TcbDegraded",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "severity": 2,
+            }),
+        ),
+        event(
+            300,
+            0,
+            "TcbDegraded",
+            json!({
+                "memberId": member_id_str(0xa1),
+                "severity": 1,
+            }),
+        ),
+    ];
+    let result = members::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let m = &result["members"][0];
+    assert_eq!(m["tcbSeverity"], 1);
+    assert_eq!(m["tcbDegradedAt"], 1_700_002_000_i64);
+}
+
+// ---------------------------------------------------------------------------
+// ComposeHashesView (unified-network-design §4.2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compose_hashes_replay_empty_returns_empty_array() {
+    let result = compose_hashes::replay_in_memory(&[], &HashMap::new(), 1_000).unwrap();
+    assert_eq!(result["composeHashes"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn compose_hashes_replay_allow_marks_row_active() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+
+    let hash = bytes32_str(0xab);
+    let events = vec![event(
+        100,
+        0,
+        "ComposeHashAllowed",
+        json!({"composeHash": hash.clone()}),
+    )];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let row = &result["composeHashes"][0];
+    assert_eq!(row["composeHash"], hash);
+    assert_eq!(row["allowedAt"], 1_700_000_000_i64);
+    assert!(row["removedAt"].is_null());
+    assert_eq!(row["active"], true);
+}
+
+#[test]
+fn compose_hashes_replay_remove_after_allow_flips_active_false() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+
+    let hash = bytes32_str(0xab);
+    let events = vec![
+        event(
+            100,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            200,
+            0,
+            "ComposeHashRemoved",
+            json!({"composeHash": hash.clone()}),
+        ),
+    ];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let row = &result["composeHashes"][0];
+    assert_eq!(row["allowedAt"], 1_700_000_000_i64);
+    assert_eq!(row["removedAt"], 1_700_001_000_i64);
+    assert_eq!(row["active"], false);
+}
+
+/// Re-adding a previously-removed hash clears `removedAt` so fabric's
+/// "active set" projection picks the row back up.
+#[test]
+fn compose_hashes_replay_re_add_clears_removed_at() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let hash = bytes32_str(0xab);
+    let events = vec![
+        event(
+            100,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            200,
+            0,
+            "ComposeHashRemoved",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            300,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+    ];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let row = &result["composeHashes"][0];
+    // `allowedAt` keeps the earliest seen (the original add at 100).
+    assert_eq!(row["allowedAt"], 1_700_000_000_i64);
+    assert!(row["removedAt"].is_null());
+    assert_eq!(row["active"], true);
+}
+
+/// Duplicate `ComposeHashAllowed` events (WS replay) must collapse
+/// to a single row without producing duplicates in the projection.
+#[test]
+fn compose_hashes_replay_duplicate_allow_is_idempotent() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+
+    let hash = bytes32_str(0xcd);
+    let events = vec![
+        event(
+            100,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            100,
+            1,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+    ];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let arr = result["composeHashes"].as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        1,
+        "duplicate allow must not produce a second row"
+    );
+    assert_eq!(arr[0]["composeHash"], hash);
+    assert_eq!(arr[0]["active"], true);
+}
+
+/// Multiple distinct hashes interleaved with adds/removes produce one
+/// row per hash. Output is sorted by compose-hash so consumers don't
+/// have to do a follow-up sort.
+#[test]
+fn compose_hashes_replay_multiple_hashes_independent_state() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(200u64, 1_700_001_000_i64);
+    block_ts.insert(300u64, 1_700_002_000_i64);
+
+    let h_low = bytes32_str(0x11);
+    let h_high = bytes32_str(0xff);
+
+    let events = vec![
+        event(
+            100,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": h_high.clone()}),
+        ),
+        event(
+            200,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": h_low.clone()}),
+        ),
+        event(
+            300,
+            0,
+            "ComposeHashRemoved",
+            json!({"composeHash": h_high.clone()}),
+        ),
+    ];
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 1_000).unwrap();
+    let arr = result["composeHashes"].as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    // Sorted lex by composeHash → low hash first.
+    assert_eq!(arr[0]["composeHash"], h_low);
+    assert_eq!(arr[0]["active"], true);
+    assert_eq!(arr[1]["composeHash"], h_high);
+    assert_eq!(arr[1]["active"], false);
+}
+
+#[test]
+fn compose_hashes_replay_respects_as_of_block_cutoff() {
+    let mut block_ts = HashMap::new();
+    block_ts.insert(100u64, 1_700_000_000_i64);
+    block_ts.insert(500u64, 1_700_005_000_i64);
+
+    let hash = bytes32_str(0x77);
+    let events = vec![
+        event(
+            100,
+            0,
+            "ComposeHashAllowed",
+            json!({"composeHash": hash.clone()}),
+        ),
+        event(
+            500,
+            0,
+            "ComposeHashRemoved",
+            json!({"composeHash": hash.clone()}),
+        ),
+    ];
+    // Cutoff at 200 — the remove at 500 is past the as_of_block and
+    // must not influence the projection.
+    let result = compose_hashes::replay_in_memory(&events, &block_ts, 200).unwrap();
+    let row = &result["composeHashes"][0];
+    assert_eq!(row["active"], true);
+    assert!(row["removedAt"].is_null());
 }
 
 // ---------------------------------------------------------------------------

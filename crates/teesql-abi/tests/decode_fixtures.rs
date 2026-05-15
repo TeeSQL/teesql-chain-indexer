@@ -17,8 +17,9 @@ use alloy::sol_types::SolEvent;
 use serde_json::json;
 
 use teesql_chain_indexer_abi::cluster_diamond::{
-    ClusterDestroyedDecoder, IClusterDiamond, LeaderClaimedDecoder, MemberRegisteredDecoder,
-    MemberRetiredDecoder, PublicEndpointUpdatedDecoder,
+    ClusterDestroyedDecoder, ComposeHashAllowedDecoder, ComposeHashRemovedDecoder, IClusterDiamond,
+    LeaderClaimedDecoder, MemberRegisteredDecoder, MemberRetiredDecoder,
+    MemberWgPubkeySetV2Decoder, PublicEndpointUpdatedDecoder, TcbDegradedDecoder,
 };
 use teesql_chain_indexer_abi::factory::{ClusterDeployedDecoder, IClusterDiamondFactory};
 use teesql_chain_indexer_abi::Decoder;
@@ -227,4 +228,233 @@ fn cluster_destroyed_decodes_to_expected_json() {
         "_signature": "ClusterDestroyed(uint256)",
     });
     assert_eq!(decoded, expected);
+}
+
+// ---------------------------------------------------------------------------
+// MemberWgPubkeySetV2 — one indexed arg + two non-indexed `bytes32`
+//
+// Unified-network-design §4.1. The contract emits the raw 32-byte WG
+// pubkey alongside a `quoteHash = keccak256(tdxQuote)` commitment.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn member_wg_pubkey_set_v2_decodes_to_expected_json() {
+    let member_id = FixedBytes::<32>::from([0x55u8; 32]);
+    let wg_pubkey = FixedBytes::<32>::from([0x66u8; 32]);
+    let quote_hash = FixedBytes::<32>::from([0x77u8; 32]);
+
+    let topics = vec![
+        IClusterDiamond::MemberWgPubkeySetV2::SIGNATURE_HASH,
+        member_id,
+    ];
+    let data = IClusterDiamond::MemberWgPubkeySetV2 {
+        memberId: member_id,
+        wgPubkey: wg_pubkey,
+        quoteHash: quote_hash,
+    }
+    .encode_data();
+    let log = make_rpc_log(topics, data);
+
+    let decoded = MemberWgPubkeySetV2Decoder.decode(&log).unwrap();
+    let expected = json!({
+        "memberId":   "0x5555555555555555555555555555555555555555555555555555555555555555",
+        "wgPubkey":   "0x6666666666666666666666666666666666666666666666666666666666666666",
+        "quoteHash":  "0x7777777777777777777777777777777777777777777777777777777777777777",
+        "_topic0":    format!("0x{}", hex::encode(IClusterDiamond::MemberWgPubkeySetV2::SIGNATURE_HASH.as_slice())),
+        "_signature": "MemberWgPubkeySetV2(bytes32,bytes32,bytes32)",
+    });
+    assert_eq!(decoded, expected);
+}
+
+/// Edge case from the task spec: a zero-byte `quoteHash` (e.g. a
+/// degenerate or pre-attestation publish path) must still decode
+/// cleanly. The on-chain validator rejects this, but the indexer is
+/// downstream of validation and should never refuse to decode a
+/// well-formed log payload — that would tank ingestion on a single
+/// anomalous row.
+#[test]
+fn member_wg_pubkey_set_v2_zero_quote_hash_decodes() {
+    let member_id = FixedBytes::<32>::from([0xaau8; 32]);
+    let wg_pubkey = FixedBytes::<32>::from([0xbbu8; 32]);
+    let quote_hash = FixedBytes::<32>::from([0u8; 32]);
+
+    let topics = vec![
+        IClusterDiamond::MemberWgPubkeySetV2::SIGNATURE_HASH,
+        member_id,
+    ];
+    let data = IClusterDiamond::MemberWgPubkeySetV2 {
+        memberId: member_id,
+        wgPubkey: wg_pubkey,
+        quoteHash: quote_hash,
+    }
+    .encode_data();
+    let log = make_rpc_log(topics, data);
+
+    let decoded = MemberWgPubkeySetV2Decoder.decode(&log).unwrap();
+    assert_eq!(
+        decoded["quoteHash"].as_str().unwrap(),
+        "0x0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    assert_eq!(
+        decoded["wgPubkey"].as_str().unwrap(),
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+}
+
+/// Two events emitted with identical payloads (a contract idempotency
+/// edge case caught by WS replay) must each decode to the same JSON.
+/// The indexer's `(chain_id, contract, block_hash, log_index)`
+/// dedup index catches the duplicate at the persistence layer; here
+/// we pin that decoding is itself pure-functional — no hidden state
+/// makes the second decode differ.
+#[test]
+fn member_wg_pubkey_set_v2_decoder_is_pure_on_duplicate_logs() {
+    let member_id = FixedBytes::<32>::from([0xccu8; 32]);
+    let wg_pubkey = FixedBytes::<32>::from([0xddu8; 32]);
+    let quote_hash = FixedBytes::<32>::from([0xeeu8; 32]);
+
+    let topics = vec![
+        IClusterDiamond::MemberWgPubkeySetV2::SIGNATURE_HASH,
+        member_id,
+    ];
+    let data = IClusterDiamond::MemberWgPubkeySetV2 {
+        memberId: member_id,
+        wgPubkey: wg_pubkey,
+        quoteHash: quote_hash,
+    }
+    .encode_data();
+    let log1 = make_rpc_log(topics.clone(), data.clone());
+    let log2 = make_rpc_log(topics, data);
+
+    let d = MemberWgPubkeySetV2Decoder;
+    assert_eq!(d.decode(&log1).unwrap(), d.decode(&log2).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// ComposeHashAllowed / ComposeHashRemoved — zero indexed args + one
+// non-indexed `bytes32`.
+//
+// IAdmin.sol L12-13 — the contract emits both with `composeHash`
+// non-indexed, so the field lives in the data slot, not the topics.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compose_hash_allowed_decodes_to_expected_json() {
+    let compose_hash = FixedBytes::<32>::from([0x88u8; 32]);
+
+    let topics = vec![IClusterDiamond::ComposeHashAllowed::SIGNATURE_HASH];
+    let data = IClusterDiamond::ComposeHashAllowed {
+        composeHash: compose_hash,
+    }
+    .encode_data();
+    let log = make_rpc_log(topics, data);
+
+    let decoded = ComposeHashAllowedDecoder.decode(&log).unwrap();
+    let expected = json!({
+        "composeHash": "0x8888888888888888888888888888888888888888888888888888888888888888",
+        "_topic0":     format!("0x{}", hex::encode(IClusterDiamond::ComposeHashAllowed::SIGNATURE_HASH.as_slice())),
+        "_signature":  "ComposeHashAllowed(bytes32)",
+    });
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn compose_hash_removed_decodes_to_expected_json() {
+    let compose_hash = FixedBytes::<32>::from([0x99u8; 32]);
+
+    let topics = vec![IClusterDiamond::ComposeHashRemoved::SIGNATURE_HASH];
+    let data = IClusterDiamond::ComposeHashRemoved {
+        composeHash: compose_hash,
+    }
+    .encode_data();
+    let log = make_rpc_log(topics, data);
+
+    let decoded = ComposeHashRemovedDecoder.decode(&log).unwrap();
+    let expected = json!({
+        "composeHash": "0x9999999999999999999999999999999999999999999999999999999999999999",
+        "_topic0":     format!("0x{}", hex::encode(IClusterDiamond::ComposeHashRemoved::SIGNATURE_HASH.as_slice())),
+        "_signature":  "ComposeHashRemoved(bytes32)",
+    });
+    assert_eq!(decoded, expected);
+}
+
+/// `ComposeHashAllowed` and `ComposeHashRemoved` must produce DIFFERENT
+/// signature hashes so the dispatch map routes each to its own
+/// decoder rather than swallowing both into a single bucket. This
+/// caught a real bug elsewhere (a pasted `event` declaration left
+/// the wrong name on the wire); pinning the property here makes
+/// the regression visible at the unit-test layer.
+#[test]
+fn compose_hash_allowed_and_removed_have_distinct_topic0() {
+    let allowed = ComposeHashAllowedDecoder.topic0();
+    let removed = ComposeHashRemovedDecoder.topic0();
+    assert_ne!(
+        allowed, removed,
+        "ComposeHashAllowed and ComposeHashRemoved must hash to distinct topic0 values"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TcbDegraded — one indexed arg + one non-indexed `uint8`
+//
+// Unified-network-design §6.3, §7. Severity is a uint8 (1 = warn,
+// 2 = critical at design time).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tcb_degraded_decodes_warn_severity() {
+    let member_id = FixedBytes::<32>::from([0xa5u8; 32]);
+
+    let topics = vec![IClusterDiamond::TcbDegraded::SIGNATURE_HASH, member_id];
+    let data = IClusterDiamond::TcbDegraded {
+        memberId: member_id,
+        severity: 1,
+    }
+    .encode_data();
+    let log = make_rpc_log(topics, data);
+
+    let decoded = TcbDegradedDecoder.decode(&log).unwrap();
+    let expected = json!({
+        "memberId":   "0xa5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "severity":   1,
+        "_topic0":    format!("0x{}", hex::encode(IClusterDiamond::TcbDegraded::SIGNATURE_HASH.as_slice())),
+        "_signature": "TcbDegraded(bytes32,uint8)",
+    });
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn tcb_degraded_decodes_critical_severity() {
+    let member_id = FixedBytes::<32>::from([0x5au8; 32]);
+
+    let topics = vec![IClusterDiamond::TcbDegraded::SIGNATURE_HASH, member_id];
+    let data = IClusterDiamond::TcbDegraded {
+        memberId: member_id,
+        severity: 2,
+    }
+    .encode_data();
+    let log = make_rpc_log(topics, data);
+
+    let decoded = TcbDegradedDecoder.decode(&log).unwrap();
+    assert_eq!(decoded["severity"].as_u64(), Some(2));
+}
+
+/// Boundary: severity `u8::MAX` (255) must decode cleanly even though
+/// the design only uses `1` and `2` today. The encoder shouldn't
+/// hard-cap the field; the indexer must round-trip whatever the
+/// contract emits.
+#[test]
+fn tcb_degraded_decodes_u8_max_severity() {
+    let member_id = FixedBytes::<32>::from([0x42u8; 32]);
+
+    let topics = vec![IClusterDiamond::TcbDegraded::SIGNATURE_HASH, member_id];
+    let data = IClusterDiamond::TcbDegraded {
+        memberId: member_id,
+        severity: u8::MAX,
+    }
+    .encode_data();
+    let log = make_rpc_log(topics, data);
+
+    let decoded = TcbDegradedDecoder.decode(&log).unwrap();
+    assert_eq!(decoded["severity"].as_u64(), Some(255));
 }
