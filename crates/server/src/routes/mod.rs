@@ -95,9 +95,23 @@ pub fn router(state: Arc<MultiChainState>, metrics: Arc<Metrics>) -> Router {
         // ingest pipeline; serves binary by default, JSON envelope on
         // `Accept: application/json`. ETag + immutable cache keyed on
         // the on-chain `quoteHash` commitment.
+        //
+        // Two routes:
+        //   - `.../quote` — latest stored quote for the member
+        //     (convenience surface for operator inspection).
+        //   - `.../quote/:quote_hash` — content-addressed by the
+        //     keccak256 commitment from the `MemberWgPubkeySetV2`
+        //     event. This is the route SSE consumers MUST use: a
+        //     latest-fetch race with member rotation would serve the
+        //     wrong bytes against the verifier's already-observed
+        //     `quoteHash`.
         .route(
             "/:chain/clusters/:addr/members/:member_id/quote",
             get(quotes::get_member_quote),
+        )
+        .route(
+            "/:chain/clusters/:addr/members/:member_id/quote/:quote_hash",
+            get(quotes::get_member_quote_by_hash),
         )
         .route(
             "/:chain/clusters/:addr/lifecycle",

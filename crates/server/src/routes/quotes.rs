@@ -1,12 +1,29 @@
-//! `GET /v1/:chain/clusters/:addr/members/:member_id/quote` —
-//! attested TDX quote bytes per unified-network-design §9.2.
+//! Two quote-fetch routes per unified-network-design §9.2:
 //!
-//! The `MemberWgPubkeySetV2` event carries `(memberId, wgPubkey,
+//!   `GET /v1/:chain/clusters/:addr/members/:member_id/quote`
+//!     Latest attested TDX quote for the member. Convenience surface
+//!     for "give me whatever's current" callers (operator dashboards,
+//!     ad-hoc inspection).
+//!
+//!   `GET /v1/:chain/clusters/:addr/members/:member_id/quote/:quote_hash`
+//!     Content-addressed lookup by `quote_hash`. The required surface
+//!     for fabric's SSE-driven admission path: an SSE consumer
+//!     observes `MemberWgPubkeySetV2{ quoteHash: A }` and MUST fetch
+//!     the bytes that hash to `A`, not "whatever's current" — between
+//!     the SSE frame and the REST fetch the member could rotate (a
+//!     same-cluster blue-green redeploy mints a new quoteHash B), and
+//!     the latest route would serve B's bytes while the verifier
+//!     still believes it asked for A's. The by-hash route closes that
+//!     TOCTOU window.
+//!
+//! Both routes return the same `cluster_member_quotes` row shape
+//! through the same content-negotiation + ETag pipeline; only the
+//! row-selection predicate differs.
+//!
+//! Source events: `MemberWgPubkeySetV2` carries `(memberId, wgPubkey,
 //! quoteHash)` only; the raw ~4.5 KB quote is recovered by the
 //! ingestor from the originating `setMemberWgPubkeyAttested` tx
-//! calldata and persisted in the `cluster_member_quotes` table. This
-//! route serves the persisted bytes back to fabric for DCAP
-//! verification.
+//! calldata and persisted in the `cluster_member_quotes` table.
 //!
 //! Content negotiation:
 //!
@@ -25,12 +42,15 @@
 //!       quoteHash` from canonical SSE/RPC state per §9.2 line 489.
 //!
 //! `If-None-Match: "0x<quoteHash>"` short-circuits to 304 when the
-//! latest stored quoteHash for the (cluster, member) matches the
-//! caller's cached value — bandwidth-saving but not load-bearing
-//! (the immutable cache headers do most of the work upstream).
+//! stored quoteHash for the resolved row matches the caller's cached
+//! value — bandwidth-saving but not load-bearing (the immutable cache
+//! headers do most of the work upstream). On the by-hash route the
+//! 304 path is degenerate (the path itself pins the hash) but
+//! preserved for symmetry with the latest route.
 //!
 //! Stable error codes (spec §15.3 "Indexer quote REST/SSE" row):
 //!   - `quote_not_found` (404) — no row for this (cluster, member)
+//!     [latest route] or `(cluster, member, quote_hash)` [by-hash]
 //!   - `quote_hash_mismatch` (500) — stored bytes don't hash to the
 //!     stored quote_hash; defense-in-depth check, should never fire
 //!   - `storage_unavailable` (503) — Postgres query failed
@@ -80,12 +100,23 @@ pub struct QuotePath {
     pub member_id: String,
 }
 
-/// Route handler. Dispatches on the `Accept` request header:
-///   - `application/json` (or `*/*` with `?accept=json`) → JSON shape
-///   - anything else (including the unset default) → octet-stream
+#[derive(Deserialize)]
+pub struct QuoteByHashPath {
+    pub chain: String,
+    pub addr: String,
+    pub member_id: String,
+    pub quote_hash: String,
+}
+
+/// `GET .../members/:member_id/quote` — serve the most recent stored
+/// quote row for the member (canonical chain order). Convenience
+/// surface; SSE consumers should NOT use this — see [`get_member_quote_by_hash`].
 ///
 /// Following the same shape as `clusters::cluster_member`, the
-/// path-parameter parsing returns 400 on malformed hex.
+/// path-parameter parsing returns 400 on malformed hex. Dispatches
+/// the body shape on the `Accept` request header:
+///   - `application/json` → JSON shape
+///   - anything else (including the unset default) → octet-stream
 pub async fn get_member_quote(
     State(state): State<Arc<MultiChainState>>,
     Path(p): Path<QuotePath>,
@@ -100,23 +131,64 @@ pub async fn get_member_quote(
     let row = match app.store.latest_member_quote(cluster, member_id).await {
         Ok(Some(row)) => row,
         Ok(None) => {
-            return Err(quote_not_found(cluster, member_id));
+            return Err(quote_not_found_latest(cluster, member_id));
         }
-        Err(e) => {
-            tracing::error!(
-                cluster = %hex::encode(cluster),
-                member = %hex::encode(member_id),
-                error = %e,
-                "cluster_member_quotes lookup failed"
-            );
-            return Err(ApiError::coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "storage_unavailable",
-                "cluster_member_quotes lookup failed",
-            ));
-        }
+        Err(e) => return Err(storage_unavailable(cluster, member_id, e)),
     };
 
+    serve_row(&app, row, cluster, member_id, common, &headers).await
+}
+
+/// `GET .../members/:member_id/quote/:quote_hash` — serve the row
+/// whose `quote_hash` matches the path-bound digest, returning 404
+/// if no row with that triple has been observed yet.
+///
+/// This is the SSE-consumer route: when fabric observes
+/// `MemberWgPubkeySetV2{ quoteHash: A }` over SSE, it must fetch the
+/// bytes that hash to `A` — fetching by "latest" would race a
+/// concurrent member rotation (same-cluster blue-green) that already
+/// minted a new `quoteHash: B`, and the latest route would silently
+/// serve B's bytes against A's commitment. The verifier downstream
+/// would then keccak-mismatch and reject the quote — correct in
+/// principle but a wasted round trip and a confusing log line. The
+/// by-hash route closes the TOCTOU window at the source.
+pub async fn get_member_quote_by_hash(
+    State(state): State<Arc<MultiChainState>>,
+    Path(p): Path<QuoteByHashPath>,
+    headers: HeaderMap,
+    axum::extract::Query(raw): axum::extract::Query<RawQuery>,
+) -> Result<Response, ApiError> {
+    let cluster = parse_address(&p.addr)?;
+    let member_id = parse_member_id(&p.member_id)?;
+    let quote_hash = parse_quote_hash(&p.quote_hash)?;
+    let common = raw.parse()?;
+
+    let app = resolve_chain(&state, &p.chain)?.clone();
+    let row = match app
+        .store
+        .member_quote_by_hash(cluster, member_id, quote_hash)
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Err(quote_not_found_by_hash(cluster, member_id, quote_hash));
+        }
+        Err(e) => return Err(storage_unavailable(cluster, member_id, e)),
+    };
+
+    serve_row(&app, row, cluster, member_id, common, &headers).await
+}
+
+/// Shared response pipeline for both quote routes: defense-in-depth
+/// integrity check, ETag short-circuit, content negotiation.
+async fn serve_row(
+    app: &AppState,
+    row: MemberQuoteRow,
+    cluster: [u8; 20],
+    member_id: [u8; 32],
+    common: CommonRead,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
     // Defense-in-depth integrity check. The ingest path already
     // verifies `keccak256(tdxQuote) == quoteHash` before persisting, so
     // a mismatch here would mean either (a) the row was tampered with
@@ -166,11 +238,27 @@ pub async fn get_member_quote(
         }
     }
 
-    if wants_json(&headers) {
-        json_response(&app, &row, common, etag_value).await
+    if wants_json(headers) {
+        json_response(app, &row, common, etag_value).await
     } else {
         Ok(octet_response(row, etag_value))
     }
+}
+
+/// Storage-failure helper — collapses repeated tracing + error-shape
+/// boilerplate for both routes' Postgres lookups.
+fn storage_unavailable(cluster: [u8; 20], member_id: [u8; 32], error: anyhow::Error) -> ApiError {
+    tracing::error!(
+        cluster = %hex::encode(cluster),
+        member = %hex::encode(member_id),
+        error = %error,
+        "cluster_member_quotes lookup failed"
+    );
+    ApiError::coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "storage_unavailable",
+        "cluster_member_quotes lookup failed",
+    )
 }
 
 /// Octet-stream response: raw bytes, ETag = `"0x<quoteHash>"`,
@@ -247,9 +335,10 @@ pub fn quote_json_payload(row: &MemberQuoteRow, as_of: &AsOf) -> Value {
     })
 }
 
-/// `quote_not_found` stable code (spec §15.3). Detail string is
-/// informational only; consumers match on `error == "quote_not_found"`.
-fn quote_not_found(cluster: [u8; 20], member_id: [u8; 32]) -> ApiError {
+/// `quote_not_found` stable code (spec §15.3) for the latest-quote
+/// route. Detail string is informational only; consumers match on
+/// `error == "quote_not_found"`.
+fn quote_not_found_latest(cluster: [u8; 20], member_id: [u8; 32]) -> ApiError {
     ApiError::coded(
         StatusCode::NOT_FOUND,
         "quote_not_found",
@@ -261,16 +350,49 @@ fn quote_not_found(cluster: [u8; 20], member_id: [u8; 32]) -> ApiError {
     )
 }
 
+/// `quote_not_found` stable code (spec §15.3) for the by-hash route.
+/// Same code, more specific detail string — includes the requested
+/// `quote_hash` so an operator who hits a 404 can see exactly which
+/// digest didn't resolve (the SSE consumer wrote that hash itself, so
+/// echoing it back accelerates triage of "the indexer hasn't
+/// recovered the bytes yet" vs "wrong member/cluster" mistakes).
+fn quote_not_found_by_hash(
+    cluster: [u8; 20],
+    member_id: [u8; 32],
+    quote_hash: [u8; 32],
+) -> ApiError {
+    ApiError::coded(
+        StatusCode::NOT_FOUND,
+        "quote_not_found",
+        format!(
+            "no attested TDX quote stored for cluster 0x{} member 0x{} quote_hash 0x{}",
+            hex::encode(cluster),
+            hex::encode(member_id),
+            hex::encode(quote_hash)
+        ),
+    )
+}
+
 /// Parse the path's `:member_id` segment. Same shape as the
 /// `clusters::cluster_member` parser — a 32-byte hex string with an
 /// optional `0x` prefix.
 fn parse_member_id(s: &str) -> Result<[u8; 32], ApiError> {
+    parse_bytes32(s, "member_id")
+}
+
+/// Parse the by-hash route's `:quote_hash` segment — the 32-byte
+/// keccak256 commitment, optional `0x` prefix.
+fn parse_quote_hash(s: &str) -> Result<[u8; 32], ApiError> {
+    parse_bytes32(s, "quote_hash")
+}
+
+fn parse_bytes32(s: &str, field: &'static str) -> Result<[u8; 32], ApiError> {
     let raw = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(raw)
-        .map_err(|e| ApiError::bad_request(format!("invalid member_id hex: {e}")))?;
+    let bytes =
+        hex::decode(raw).map_err(|e| ApiError::bad_request(format!("invalid {field} hex: {e}")))?;
     if bytes.len() != 32 {
         return Err(ApiError::bad_request(format!(
-            "member_id must be 32 bytes; got {}",
+            "{field} must be 32 bytes; got {}",
             bytes.len()
         )));
     }
@@ -482,11 +604,53 @@ mod tests {
     }
 
     #[test]
-    fn quote_not_found_carries_stable_tag() {
-        let err = quote_not_found([0u8; 20], [0u8; 32]);
+    fn quote_not_found_latest_carries_stable_tag() {
+        let err = quote_not_found_latest([0u8; 20], [0u8; 32]);
         // ApiError doesn't expose tag/status publicly, so rebuild the
         // response and check the body.
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn quote_not_found_by_hash_echoes_quote_hash_in_detail() {
+        // The by-hash 404 detail string MUST surface the requested
+        // quote_hash so an operator hitting "quote not found" can
+        // immediately tell whether they got the cluster/member wrong
+        // vs the indexer simply hasn't recovered that quote_hash yet.
+        // Pin the detail-shape requirement against drift.
+        let err = quote_not_found_by_hash([0x11u8; 20], [0x22u8; 32], [0x33u8; 32]);
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn parse_quote_hash_accepts_0x_prefix() {
+        let h =
+            parse_quote_hash("0x3333333333333333333333333333333333333333333333333333333333333333")
+                .unwrap();
+        assert_eq!(h, [0x33u8; 32]);
+    }
+
+    #[test]
+    fn parse_quote_hash_accepts_bare_hex() {
+        let h =
+            parse_quote_hash("4444444444444444444444444444444444444444444444444444444444444444")
+                .unwrap();
+        assert_eq!(h, [0x44u8; 32]);
+    }
+
+    #[test]
+    fn parse_quote_hash_rejects_short_hex() {
+        let err = parse_quote_hash("0xdead").unwrap_err();
+        let body = format!("{err}");
+        assert!(body.contains("32 bytes"), "{body}");
+    }
+
+    #[test]
+    fn parse_quote_hash_rejects_non_hex() {
+        let err = parse_quote_hash("0xnotzhex").unwrap_err();
+        let body = format!("{err}");
+        assert!(body.contains("hex"), "{body}");
     }
 }

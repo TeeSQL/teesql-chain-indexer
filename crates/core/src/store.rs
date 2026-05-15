@@ -92,7 +92,10 @@ pub struct ControlHoleRow {
 /// §9.2). Stores the raw TDX quote bytes the chain-indexer recovered
 /// from the `setMemberWgPubkeyAttested` tx calldata for a given
 /// `MemberWgPubkeySetV2` event. Immutable per row — quote bytes never
-/// change for a given `quote_hash`.
+/// change for a given `quote_hash`; only `block_*` / `tx_hash` shift
+/// on reorg revival (the row's `removed` flag flips at the SQL layer
+/// but is filtered out of every public read path, so consumers of
+/// `MemberQuoteRow` only ever see live rows).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberQuoteRow {
     pub chain_id: i32,
@@ -886,11 +889,21 @@ impl EventStore {
     }
 
     /// Insert a `cluster_member_quotes` row for a `MemberWgPubkeySetV2`
-    /// emission. Returns `true` when the row was newly inserted,
-    /// `false` when an identical `(chain_id, cluster_address, member_id,
-    /// quote_hash)` row already existed (idempotent — every quote is
-    /// content-addressed by its keccak256 digest, so a re-observation
-    /// from WS replay / cold-start overlap is a no-op).
+    /// emission. Returns `true` when the row was newly inserted or
+    /// revived from a `removed = true` reorg-rolled-back state,
+    /// `false` when an identical `(chain_id, cluster_address,
+    /// member_id, quote_hash)` row already existed live (idempotent —
+    /// every quote is content-addressed by its keccak256 digest, so a
+    /// re-observation from WS replay / cold-start overlap is a
+    /// no-op).
+    ///
+    /// Reorg revival: if a previous reorg flipped the row's `removed`
+    /// to `true`, the replay path re-emits the event onto the new
+    /// canonical chain and calls this method again. We clear
+    /// `removed` back to `false` and refresh the block coordinates to
+    /// the new canonical position. `quote_bytes` and `quote_hash` are
+    /// content-addressed and never change for a given key — they're
+    /// re-bound to the same values they already held.
     ///
     /// The caller MUST verify `keccak256(quote_bytes) == quote_hash`
     /// before invoking this method. The schema treats stored bytes as
@@ -914,17 +927,28 @@ impl EventStore {
     ) -> anyhow::Result<bool> {
         let block_number_i64 = i64::try_from(block_number)
             .map_err(|_| anyhow::anyhow!("block_number {block_number} overflows i64"))?;
-        // `RETURNING xmax` lets us distinguish "newly inserted" (xmax=0)
-        // from "row already existed" — the latter returns no rows under
-        // `ON CONFLICT DO NOTHING`, so a present row in the result set
-        // is unambiguous evidence of a fresh write. Postgres-specific
-        // but the entire store layer already targets Postgres.
+        // ON CONFLICT branch: when the row exists and is reorg-marked
+        // (`removed = true`), revive it by clearing the flag + refreshing
+        // canonical block coordinates from the replay-side event. When
+        // the row exists live (`removed = false`), the WHERE predicate
+        // suppresses the UPDATE so the conflict path returns no rows —
+        // we treat that as "already live, idempotent re-observation"
+        // and report `false`. The `RETURNING 1` projection is fed by
+        // both branches (the fresh INSERT and the revival UPDATE), so
+        // `Some(_)` is the "wrote something" signal.
         let inserted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO cluster_member_quotes (\
                  chain_id, cluster_address, member_id, quote_hash, wg_pubkey, \
-                 quote_bytes, block_number, block_hash, log_index, tx_hash\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-             ON CONFLICT (chain_id, cluster_address, member_id, quote_hash) DO NOTHING \
+                 quote_bytes, block_number, block_hash, log_index, tx_hash, removed\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false) \
+             ON CONFLICT (chain_id, cluster_address, member_id, quote_hash) \
+             DO UPDATE SET \
+                 removed = false, \
+                 block_number = EXCLUDED.block_number, \
+                 block_hash = EXCLUDED.block_hash, \
+                 log_index = EXCLUDED.log_index, \
+                 tx_hash = EXCLUDED.tx_hash \
+             WHERE cluster_member_quotes.removed = true \
              RETURNING 1",
         )
         .bind(self.chain_id)
@@ -942,6 +966,48 @@ impl EventStore {
         Ok(inserted.is_some())
     }
 
+    /// Mark every `cluster_member_quotes` row whose source
+    /// `MemberWgPubkeySetV2` event landed past `common_ancestor_block`
+    /// as `removed = true`. Returns the count of rows flipped.
+    ///
+    /// Mirrors `mark_removed_after` / `mark_control_removed_after`:
+    /// the reorg handler in `Ingestor::handle_reorg` calls this
+    /// alongside the events + control-plane variants so a quote
+    /// recovered from a now-orphaned tx isn't visible to the REST
+    /// surface until the replay re-observes it on the new canonical
+    /// chain. Quotes are content-addressed by `quote_hash`, so the
+    /// typical post-reorg replay either:
+    ///   - re-emits the same `MemberWgPubkeySetV2` event at a new
+    ///     `(block_number, block_hash, log_index, tx_hash)` and the
+    ///     replay's `upsert_member_quote` revives the row, or
+    ///   - never re-emits (the tx that produced the quote was the
+    ///     forked-out branch's only commitment to that pubkey
+    ///     rotation), and the row stays `removed = true` permanently
+    ///     — invisible to the REST surface, preserved on disk as
+    ///     forensic evidence.
+    ///
+    /// Index used: the PK B-tree probes per row, but the predicate
+    /// `block_number > $1` is the high-selectivity term. Rows past a
+    /// finality window stay shallow in practice (single-digit blocks
+    /// at base layer's reorg depth).
+    pub async fn mark_member_quotes_removed_after(
+        &self,
+        common_ancestor_block: u64,
+    ) -> anyhow::Result<u64> {
+        let n_i64 = i64::try_from(common_ancestor_block)
+            .map_err(|_| anyhow::anyhow!("block {common_ancestor_block} overflows i64"))?;
+        let result = sqlx::query(
+            "UPDATE cluster_member_quotes \
+             SET removed = true \
+             WHERE chain_id = $1 AND block_number > $2 AND removed = false",
+        )
+        .bind(self.chain_id)
+        .bind(n_i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Look up the most recently emitted quote row for a given
     /// `(cluster_address, member_id)`. "Most recent" is defined by
     /// canonical chain order: `(block_number DESC, log_index DESC)`.
@@ -949,6 +1015,13 @@ impl EventStore {
     /// quote (i.e. no `MemberWgPubkeySetV2` event observed for the
     /// member yet, or the indexer hasn't recovered the bytes from
     /// tx calldata).
+    ///
+    /// Filters `removed = false` so a reorg-rolled-back row never
+    /// surfaces here as "the canonical latest" — the REST surface
+    /// would otherwise serve forked-out quote bytes to a verifier
+    /// during the rollback-to-replay window. The replay's
+    /// `upsert_member_quote` revives the row on the new canonical
+    /// chain.
     ///
     /// Used by the REST quote surface at
     /// `GET /v1/{chain}/clusters/{addr}/members/{id}/quote` (§9.2).
@@ -970,6 +1043,7 @@ impl EventStore {
                     r2_uri, observed_at \
              FROM cluster_member_quotes \
              WHERE chain_id = $1 AND cluster_address = $2 AND member_id = $3 \
+               AND removed = false \
              ORDER BY block_number DESC, log_index DESC \
              LIMIT 1",
         )
@@ -986,9 +1060,16 @@ impl EventStore {
     }
 
     /// Look up a specific historical quote by `(cluster, member, quote_hash)`.
-    /// Used by an integrity recheck path that wants to fetch a quote by
-    /// its content-addressed digest rather than "most recent". Returns
-    /// `None` when no row matches.
+    /// Used by the by-hash REST surface at
+    /// `GET /v1/{chain}/clusters/{addr}/members/{id}/quote/{quote_hash}`
+    /// (§9.2) and by the ingest path's idempotent short-circuit. Returns
+    /// `None` when no live row matches.
+    ///
+    /// Filters `removed = false` so the ingest-path short-circuit
+    /// (`recover_attested_quote_from_event` precheck) re-runs after a
+    /// reorg replay re-observes the event — without the filter, the
+    /// short-circuit would see the dead row and skip the revival
+    /// upsert that flips `removed` back to false.
     ///
     /// Index used: PK `(chain_id, cluster_address, member_id, quote_hash)`.
     pub async fn member_quote_by_hash(
@@ -1004,6 +1085,7 @@ impl EventStore {
              FROM cluster_member_quotes \
              WHERE chain_id = $1 AND cluster_address = $2 \
                AND member_id = $3 AND quote_hash = $4 \
+               AND removed = false \
              LIMIT 1",
         )
         .bind(self.chain_id)

@@ -278,6 +278,113 @@ mod tests {
         assert_eq!(err, expected, "error carries the actual digest");
     }
 
+    /// End-to-end helper chain that `Ingestor::recover_attested_quote_from_event`
+    /// composes:
+    ///
+    ///   1. parse `(memberId, wgPubkey, quoteHash)` out of the decoded
+    ///      event JSON (`parse_bytes32_field`, in `ingest.rs`),
+    ///   2. extract the raw quote bytes from the tx calldata
+    ///      (`extract_attested_quote_bytes`, here),
+    ///   3. verify the on-chain hash commitment
+    ///      (`verify_quote_hash_commitment`, here).
+    ///
+    /// The full method also calls `provider.get_transaction_by_hash`
+    /// (skipped here — would need a mock alloy Provider, which is too
+    /// heavy a dependency for a unit test) and
+    /// `EventStore::upsert_member_quote` (covered by the `#[ignore]`-
+    /// gated DB tests in `crates/core/tests/store_tests.rs`). This
+    /// test stitches the pure-helper subset together so a refactor
+    /// that breaks the round-trip between the decoded payload's
+    /// field names and the calldata extractor's bindings trips here.
+    #[test]
+    fn recovers_quote_end_to_end_from_synthetic_event_and_calldata() {
+        // Step 0: synthesize a `MemberWgPubkeySetV2` decoded payload
+        // (the shape emitted by `MemberWgPubkeySetV2Decoder` in the
+        // abi crate). Hex field names match the contract's camelCase
+        // sol! event spelling — this is exactly what the ingestor's
+        // `event.decoded` carries.
+        let member_id_bytes = [0xa1u8; 32];
+        let wg_pubkey_bytes = [0xb2u8; 32];
+        let quote = vec![0xc3u8; 4632]; // realistic 4.5 KB TDX quote
+        let quote_hash_bytes: [u8; 32] = keccak256(&quote).into();
+        let payload = serde_json::json!({
+            "memberId":  format!("0x{}", hex::encode(member_id_bytes)),
+            "wgPubkey":  format!("0x{}", hex::encode(wg_pubkey_bytes)),
+            "quoteHash": format!("0x{}", hex::encode(quote_hash_bytes)),
+        });
+
+        // Step 1: pull the three bytes32 fields by name. Inline a
+        // local clone of `parse_bytes32_field` to avoid pulling the
+        // whole `ingest` module in as a test dep (it's `pub` but lives
+        // in a sibling module of `quote_recovery`).
+        fn pull_bytes32(payload: &serde_json::Value, field: &str) -> [u8; 32] {
+            let s = payload.get(field).and_then(|v| v.as_str()).unwrap();
+            let raw = s.strip_prefix("0x").unwrap_or(s);
+            let bytes = hex::decode(raw).unwrap();
+            let arr: [u8; 32] = bytes.try_into().unwrap();
+            arr
+        }
+        let member_id = pull_bytes32(&payload, "memberId");
+        let quote_hash = pull_bytes32(&payload, "quoteHash");
+        assert_eq!(member_id, member_id_bytes);
+        assert_eq!(quote_hash, quote_hash_bytes);
+
+        // Step 2: synthesize the originating tx's calldata, then
+        // recover the quote bytes through the extractor. This mirrors
+        // exactly what the real `recover_attested_quote_from_event`
+        // does once it has the tx body from `provider.get_transaction_by_hash`.
+        let calldata = make_call_bytes(member_id_bytes, quote_hash_bytes, quote.clone());
+        let recovered = extract_attested_quote_bytes(&calldata, &member_id, &quote_hash)
+            .unwrap()
+            .expect("extractor finds the call");
+        assert_eq!(recovered, quote);
+
+        // Step 3: defense-in-depth commitment check, same one the
+        // ingestor runs before the DB upsert.
+        verify_quote_hash_commitment(&recovered, &quote_hash)
+            .expect("recovered bytes match the on-chain commitment");
+    }
+
+    /// Companion to the success-path helper test above: if the
+    /// extractor returns bytes that don't hash to `quoteHash` (bug
+    /// in the scanner picked up the wrong inner call), the commitment
+    /// check rejects them. This is the safety net that keeps a bad
+    /// scan from polluting the `cluster_member_quotes` table.
+    #[test]
+    fn rejects_recovered_quote_whose_commitment_mismatches() {
+        let member_id = [0x11u8; 32];
+        let real_quote = vec![0x22u8; 64];
+        let real_hash: [u8; 32] = keccak256(&real_quote).into();
+
+        // Tampered: bytes claim to be the quote but the on-chain
+        // `quoteHash` is keccak256(some_OTHER_payload). The contract
+        // would never have admitted this on chain — the extractor
+        // wouldn't ever recover it in practice — but the defensive
+        // check ensures a buggy extractor branch can't silently
+        // bypass the invariant.
+        let tampered = vec![0x99u8; 64];
+        let err = verify_quote_hash_commitment(&tampered, &real_hash).unwrap_err();
+        let tampered_digest: [u8; 32] = keccak256(&tampered).into();
+        assert_eq!(err, tampered_digest);
+        assert_ne!(
+            err, real_hash,
+            "the error carries the bad digest, not the expected one"
+        );
+
+        // And explicitly: the (member_id, quote_hash) tuple match
+        // inside the scanner is the SECOND line of defense. A
+        // tampered calldata constructed with a different `quoteHash`
+        // wouldn't even pass the extractor's bindings filter; pin
+        // that here too with synthesized calldata.
+        let bad_hash = keccak256(b"different payload").into();
+        let bad_calldata = make_call_bytes(member_id, bad_hash, tampered);
+        let result = extract_attested_quote_bytes(&bad_calldata, &member_id, &real_hash).unwrap();
+        assert!(
+            result.is_none(),
+            "extractor rejects calldata whose embedded quoteHash disagrees with the event's"
+        );
+    }
+
     #[test]
     fn ignores_random_selector_collisions_in_surrounding_bytes() {
         // Craft an input where the first 4 bytes happen to equal the

@@ -289,21 +289,47 @@ CREATE TABLE IF NOT EXISTS cluster_member_quotes (
   tx_hash          bytea NOT NULL,                 -- setMemberWgPubkeyAttested tx
   r2_uri           text,                           -- NULL until R2 mirror upload succeeds
   observed_at      timestamptz NOT NULL DEFAULT now(),
+  -- Reorg rollback flag — flipped to true when the row's source
+  -- `MemberWgPubkeySetV2` event lands past the common ancestor of a
+  -- reorg, then back to false by the cold-start replay that re-emits
+  -- the event onto the new canonical chain. Mirrors the `removed`
+  -- convention on `events`, `control_instructions`, `control_acks`.
+  -- All read paths (latest_member_quote, member_quote_by_hash,
+  -- REST handler) filter `removed = false` so a rolled-back row
+  -- can't be served as the canonical answer between rollback and
+  -- replay. Quote bytes themselves are content-addressed and never
+  -- change for a given quote_hash, so the row survives the rollback
+  -- as a soft-delete and is reanimated by the replay's upsert.
+  removed          boolean NOT NULL DEFAULT false,
   PRIMARY KEY (chain_id, cluster_address, member_id, quote_hash)
 );
+
+-- Idempotent backfill of `removed` on clusters provisioned before
+-- the reorg-cleanup follow-up landed. Default to false (matching
+-- the column declaration above) so existing rows are visible to
+-- the `removed = false` filter immediately.
+ALTER TABLE cluster_member_quotes
+    ADD COLUMN IF NOT EXISTS removed boolean NOT NULL DEFAULT false;
 
 -- Latest-quote-per-member lookup. The REST handler answers
 -- `GET .../members/{id}/quote` with the most recently observed row;
 -- ordering by `block_number DESC, log_index DESC` matches canonical
 -- chain order so a replayed older event cannot displace a newer one
--- by virtue of arriving later in wall-clock time.
+-- by virtue of arriving later in wall-clock time. The query layer
+-- adds `WHERE removed = false` to filter reorg-rolled-back rows; the
+-- index is intentionally NOT partial so re-running this provision
+-- script against an in-place upgrade doesn't try to drop+recreate
+-- (CREATE INDEX IF NOT EXISTS is idempotent on name, not predicate).
 CREATE INDEX IF NOT EXISTS cluster_member_quotes_latest_idx
     ON cluster_member_quotes
        (chain_id, cluster_address, member_id, block_number DESC, log_index DESC);
 
 -- R2-mirror backfill index — finds rows that still need an upload.
 -- Partial index keeps the scan tight when the indexer is configured
--- with the mirror enabled.
+-- with the mirror enabled. The backfill sweep also filters `removed
+-- = false` at query time so a reorg-rolled-back row isn't mirrored;
+-- the predicate stays NULL-only here for the same shape-stability
+-- reason as the latest index above.
 CREATE INDEX IF NOT EXISTS cluster_member_quotes_pending_r2_idx
     ON cluster_member_quotes (chain_id, observed_at)
     WHERE r2_uri IS NULL;

@@ -495,3 +495,192 @@ async fn quote_route_rejects_bad_cluster_address() {
         resp.status()
     );
 }
+
+// ── /v1/:chain/clusters/:addr/members/:member_id/quote/:quote_hash ──
+//
+// Content-addressed by-hash route — the surface SSE consumers MUST
+// use to avoid the rotation race between an observed quoteHash and a
+// "latest" fetch. The 4xx-shape tests mirror the latest-route ones;
+// the success path needs DB infra and is covered in the `#[ignore]`-
+// gated store_tests.rs block.
+
+#[tokio::test]
+async fn quote_by_hash_route_unknown_chain_404s_cleanly() {
+    let state = build_chain_agnostic_state("TEESQL_CI_QUOTE_BYHASH_UNKNOWN_CHAIN").await;
+    let app = build_router(state);
+
+    let uri = format!(
+        "/v1/ethereum/clusters/{}/members/{}/quote/{}",
+        "0x0000000000000000000000000000000000000001",
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222222222222222222222222222"
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert!(status.is_client_error(), "expected 4xx, got {}", status);
+}
+
+#[tokio::test]
+async fn quote_by_hash_route_rejects_short_quote_hash() {
+    // The by-hash route adds a third bytes32 path segment over the
+    // latest route. Pin that a malformed `:quote_hash` doesn't
+    // silently 500 — the parser layer matches `parse_member_id`'s
+    // shape so a regression there would tank both routes together.
+    let state = build_chain_agnostic_state("TEESQL_CI_QUOTE_BYHASH_BAD_HASH").await;
+    let app = build_router(state);
+
+    let uri = format!(
+        "/v1/ethereum/clusters/{}/members/{}/quote/{}",
+        "0x0000000000000000000000000000000000000001",
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "0xdead" // 2 bytes, not 32
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "expected 4xx for malformed quote_hash, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn quote_by_hash_route_rejects_bad_member_id() {
+    let state = build_chain_agnostic_state("TEESQL_CI_QUOTE_BYHASH_BAD_MEMBER").await;
+    let app = build_router(state);
+
+    let uri = format!(
+        "/v1/ethereum/clusters/{}/members/{}/quote/{}",
+        "0x0000000000000000000000000000000000000001",
+        "0xshort",
+        "0x2222222222222222222222222222222222222222222222222222222222222222"
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "expected 4xx for malformed member_id, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn quote_by_hash_route_rejects_bad_cluster_address() {
+    let state = build_chain_agnostic_state("TEESQL_CI_QUOTE_BYHASH_BAD_ADDR").await;
+    let app = build_router(state);
+
+    let uri = format!(
+        "/v1/ethereum/clusters/{}/members/{}/quote/{}",
+        "not-an-address",
+        "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222222222222222222222222222"
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_client_error(),
+        "expected 4xx for malformed address, got {}",
+        resp.status()
+    );
+}
+
+// SSE consumer contract — the `MemberWgPubkeySetV2` decoder emits
+// `quoteHash` in its decoded-JSON output so SSE subscribers see it
+// in `/events/:id` and can then call the by-hash quote route. That
+// wire-shape is pinned by
+// `crates/teesql-abi/tests/decode_fixtures.rs::member_wg_pubkey_set_v2_decodes_to_expected_json`,
+// which asserts the exact JSON keys including `quoteHash`. The
+// router crate forwards the decoded payload verbatim through both
+// the `/events/:id` lookup and the SSE LISTEN bridge — adding a
+// duplicate decoder test here would only re-cover ground.
+
+// ── #[ignore]-gated success-path tests (DATABASE_URL required) ─────
+//
+// These exercise the end-to-end GET-stored-bytes flow through the
+// real router + a backing Postgres pool. CI without a DB fixture
+// skips them; the assertions below double as the spec for what a
+// future sqlx::test / testcontainers harness needs to set up.
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + full per-chain MultiChainState wired with EventStore"]
+async fn quote_route_serves_stored_bytes_octet_stream() {
+    // Stub for the v0.4.0 Tier-2 harness. The integration would:
+    //   1. Build a real EventStore with a Postgres pool over
+    //      `provision.sql`'s schema (live-DB harness).
+    //   2. Build a `MultiChainState` whose `by_shortname` contains an
+    //      AppState pointing at that store with a known chain id +
+    //      shortname (e.g. "base").
+    //   3. Call `EventStore::upsert_member_quote` with a synthetic
+    //      `(cluster, member, quote_hash, bytes)` and assert it inserts.
+    //   4. GET /v1/base/clusters/<cluster>/members/<member>/quote with
+    //      no Accept header → 200, body == stored bytes, ETag matches
+    //      `"0x<quote_hash>"`, `Cache-Control: public, max-age=31536000,
+    //      immutable`, `Content-Type: application/octet-stream`.
+    //   5. Repeat with `If-None-Match: "0x<quote_hash>"` → 304.
+    //   6. Repeat with `Accept: application/json` → JSON envelope
+    //      whose `data.quote` base64-decodes to the stored bytes.
+    //   7. Repeat against the by-hash route at the matching path
+    //      segment and assert it returns the same payload.
+    // Left as a stub until the harness lands; the in-process route
+    // wiring + headers + parser are already covered by the inline
+    // tests above + the routes::quotes::tests module.
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + per-chain MultiChainState"]
+async fn quote_by_hash_route_serves_specific_quote_after_rotation() {
+    // Stub — companion to `quote_route_serves_stored_bytes_octet_stream`.
+    // Pins the SSE-consumer contract: when two `MemberWgPubkeySetV2`
+    // events for the same member produce two distinct `quote_hash`
+    // values, the by-hash route serves the SPECIFIC quote requested
+    // even if a newer rotation has already minted a higher-block row.
+    // Latest-route would race the rotation; by-hash route closes the
+    // window.
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + per-chain MultiChainState"]
+async fn quote_route_returns_404_after_reorg_rollback() {
+    // Stub — pins the reorg-cleanup contract end-to-end at the HTTP
+    // layer. Sequence:
+    //   1. Upsert a quote row at block 200.
+    //   2. Confirm GET /quote returns 200 with the bytes.
+    //   3. Call `mark_member_quotes_removed_after(150)`.
+    //   4. Confirm GET /quote returns 404 / `quote_not_found`.
+    //   5. Re-upsert the same `(member, quote_hash)` at block 205
+    //      (replay path).
+    //   6. Confirm GET /quote returns 200 with refreshed block coords.
+}

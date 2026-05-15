@@ -302,6 +302,60 @@ fn member_wg_pubkey_set_v2_zero_quote_hash_decodes() {
     );
 }
 
+/// SSE-consumer contract pin (GAP-W1-003). The by-hash quote REST
+/// route requires that an SSE consumer be able to read `quoteHash`
+/// from the decoded event payload it pulls via `GET /events/:id`.
+/// The full-shape match above (`member_wg_pubkey_set_v2_decodes_to_expected_json`)
+/// already pins the JSON keys, but a future refactor that re-orders
+/// or renames keys could slip past that test by also re-shaping the
+/// `expected` literal. This focused test asserts the
+/// SSE-consumer-visible field is named exactly `quoteHash`
+/// (camelCase, the on-chain ABI spelling) and that its value is the
+/// lowercase 0x-prefixed hex of the bytes32 commitment — exactly the
+/// shape the by-hash REST route's `:quote_hash` path segment
+/// accepts. Drift here breaks the SSE → by-hash GET handshake at the
+/// wire level, so this test is intentionally narrow + load-bearing.
+#[test]
+fn member_wg_pubkey_set_v2_emits_quote_hash_for_sse_consumers() {
+    let member_id = FixedBytes::<32>::from([0xabu8; 32]);
+    let wg_pubkey = FixedBytes::<32>::from([0xcdu8; 32]);
+    let quote_hash = FixedBytes::<32>::from([0xefu8; 32]);
+
+    let topics = vec![
+        IClusterDiamond::MemberWgPubkeySetV2::SIGNATURE_HASH,
+        member_id,
+    ];
+    let data = IClusterDiamond::MemberWgPubkeySetV2 {
+        memberId: member_id,
+        wgPubkey: wg_pubkey,
+        quoteHash: quote_hash,
+    }
+    .encode_data();
+    let log = make_rpc_log(topics, data);
+
+    let decoded = MemberWgPubkeySetV2Decoder.decode(&log).unwrap();
+
+    // Pin the SSE-consumer field name + value shape. A refactor that
+    // accidentally renames this to `quote_hash` (snake_case),
+    // `commitment`, etc. would silently break every fabric admission
+    // path that derives the by-hash URL from the SSE frame.
+    let qh = decoded
+        .get("quoteHash")
+        .and_then(|v| v.as_str())
+        .expect("SSE consumers read `quoteHash` from the decoded payload");
+    assert_eq!(
+        qh, "0xefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+        "quoteHash must be lowercase 0x-prefixed hex of the bytes32 commitment"
+    );
+    // The same SSE consumer also reads `memberId` to build the
+    // `.../members/:member_id/quote/:quote_hash` path. Pin its shape
+    // too so a co-renamed pair would still trip.
+    assert_eq!(
+        decoded.get("memberId").and_then(|v| v.as_str()).unwrap(),
+        "0xabababababababababababababababababababababababababababababababab"
+    );
+}
+
 /// Two events emitted with identical payloads (a contract idempotency
 /// edge case caught by WS replay) must each decode to the same JSON.
 /// The indexer's `(chain_id, contract, block_hash, log_index)`

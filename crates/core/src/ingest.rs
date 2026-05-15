@@ -713,12 +713,27 @@ impl Ingestor {
             .mark_control_removed_after(common)
             .await
             .map_err(IngestError::Transient)?;
+        // GAP-W1-003: `cluster_member_quotes` is another dedicated
+        // table (raw TDX quote bytes recovered from
+        // `setMemberWgPubkeyAttested` tx calldata, keyed by
+        // `(chain, cluster, member, quote_hash)`). Roll back the rows
+        // whose source `MemberWgPubkeySetV2` event landed past the
+        // common ancestor so the REST surface stops serving
+        // forked-out quote bytes between rollback and replay. The
+        // replay-side `upsert_member_quote` revives the row when the
+        // event re-emits on the new canonical chain.
+        let removed_quotes = self
+            .store
+            .mark_member_quotes_removed_after(common)
+            .await
+            .map_err(IngestError::Transient)?;
         tracing::warn!(
             chain_id = self.chain_id,
             common_ancestor = common,
             head,
             removed_events = removed,
             removed_control = removed_control,
+            removed_quotes = removed_quotes,
             "reorg rollback applied; replaying views forward"
         );
 
