@@ -134,6 +134,13 @@ CREATE TABLE cluster_members (
   passthrough      bytea,
   dns_label        text,
   public_endpoint  text,
+  -- Explicit `host:port` target the fabric uotcp dialer connects to
+  -- when establishing this member's WireGuard tunnel. Derived from
+  -- `public_endpoint` (Phala deployment metadata) at materialization
+  -- time so fabric never has to parse the URL or guess the port —
+  -- spec docs/designs/network-architecture-unified.md §3.3, §9.3.
+  -- NULL until `PublicEndpointUpdated` lands a parseable URL.
+  wg_endpoint      text,
   -- WireGuard pubkey hex (lowercase 64-char Curve25519, no 0x prefix).
   -- Populated by V1 `MemberWgPubkeySet` events emitted by WgMeshFacet
   -- (Phase 1 fabric cross-boundary). NULL until the member's first
@@ -333,6 +340,13 @@ CREATE INDEX IF NOT EXISTS cluster_member_quotes_latest_idx
 CREATE INDEX IF NOT EXISTS cluster_member_quotes_pending_r2_idx
     ON cluster_member_quotes (chain_id, observed_at)
     WHERE r2_uri IS NULL;
+
+-- Idempotent backfill of `wg_endpoint` on clusters provisioned before
+-- GAP-W1-005 (the unified-architecture wg_endpoint surface). On an
+-- upgraded DB the column is added empty; the next `PublicEndpointUpdated`
+-- event back-populates it. Operators can also force a rebuild by
+-- re-running the materializer's replay path for the cluster.
+ALTER TABLE cluster_members ADD COLUMN IF NOT EXISTS wg_endpoint text;
 
 CREATE TABLE cluster_lifecycle (
   chain_id         int NOT NULL,

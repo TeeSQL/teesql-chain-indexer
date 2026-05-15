@@ -6,15 +6,18 @@
 //!
 //! - `MemberRegistered` upserts the registration-time fields
 //!   (instance_id, passthrough, dns_label, registered_at). It must
-//!   leave `public_endpoint` and `retired_at` untouched on conflict
-//!   so a `PublicEndpointUpdated` or `MemberRetired` that landed
-//!   first isn't clobbered when WS replay or HA double-write
-//!   re-delivers `MemberRegistered`.
+//!   leave `public_endpoint`, `wg_endpoint`, and `retired_at`
+//!   untouched on conflict so a `PublicEndpointUpdated` or
+//!   `MemberRetired` that landed first isn't clobbered when WS
+//!   replay or HA double-write re-delivers `MemberRegistered`.
 //!
-//! - `PublicEndpointUpdated` writes only `public_endpoint`. If the
-//!   row doesn't exist (out-of-order arrival or a stub-creating
-//!   replay), we insert a sparse row and emit a warning so the
-//!   gap is visible in logs.
+//! - `PublicEndpointUpdated` writes `public_endpoint` AND derives
+//!   `wg_endpoint` from the same URL via [`derive_wg_endpoint`] —
+//!   the explicit `wg_endpoint` field per spec §3.3 / §9.3 is the
+//!   uotcp dialer's TCP target so fabric never has to parse the URL
+//!   or guess the port. If the row doesn't exist (out-of-order
+//!   arrival or a stub-creating replay), we insert a sparse row and
+//!   emit a warning so the gap is visible in logs.
 //!
 //! - `MemberRetired` writes only `retired_at`. If the row doesn't
 //!   exist we emit a warning and drop the event — there's no row
@@ -193,13 +196,28 @@ async fn apply_public_endpoint_updated(store: &EventStore, event: &DecodedEvent)
             hex_repr
         }
     };
+    let wg_endpoint = match derive_wg_endpoint(&public_endpoint) {
+        Ok(addr) => Some(addr),
+        Err(e) => {
+            warn!(
+                chain_id = event.chain_id,
+                cluster = %decoded::hex0x(&event.contract),
+                member = %decoded::hex0x(&member_id),
+                public_endpoint = %public_endpoint,
+                error = %e,
+                "publicEndpoint did not parse into a Phala-gateway uotcp target; wg_endpoint left NULL"
+            );
+            None
+        }
+    };
 
     let row = sqlx::query(
         "INSERT INTO cluster_members \
-            (chain_id, cluster_address, member_id, public_endpoint) \
-         VALUES ($1, $2, $3, $4) \
+            (chain_id, cluster_address, member_id, public_endpoint, wg_endpoint) \
+         VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (chain_id, cluster_address, member_id) DO UPDATE SET \
              public_endpoint = EXCLUDED.public_endpoint, \
+             wg_endpoint     = EXCLUDED.wg_endpoint, \
              updated_at      = now() \
          RETURNING (xmax = 0) AS inserted",
     )
@@ -207,9 +225,10 @@ async fn apply_public_endpoint_updated(store: &EventStore, event: &DecodedEvent)
     .bind(&event.contract[..])
     .bind(&member_id[..])
     .bind(&public_endpoint)
+    .bind(wg_endpoint.as_deref())
     .fetch_one(store.pool())
     .await
-    .context("upsert public_endpoint")?;
+    .context("upsert public_endpoint + wg_endpoint")?;
 
     let inserted: bool = row.try_get("inserted")?;
     if inserted {
@@ -501,6 +520,7 @@ struct MemberRow {
     passthrough: Option<[u8; 20]>,
     dns_label: Option<String>,
     public_endpoint: Option<String>,
+    wg_endpoint: Option<String>,
     wg_pubkey_hex: Option<String>,
     /// Raw 32-byte WG pubkey from `MemberWgPubkeySetV2`. Independent of
     /// `wg_pubkey_hex` (V1) — the indexer surfaces both so fabric can
@@ -541,6 +561,7 @@ impl MemberRow {
             "passthrough": self.passthrough.as_ref().map(|b| decoded::hex0x(b)),
             "dnsLabel": self.dns_label,
             "publicEndpoint": self.public_endpoint,
+            "wgEndpoint": self.wg_endpoint,
             "wgPubkeyHex": self.wg_pubkey_hex,
             "wgPubkey": self.wg_pubkey.as_ref().map(|b| decoded::hex0x(b)),
             "quoteHash": self.quote_hash.as_ref().map(|b| decoded::hex0x(b)),
@@ -600,10 +621,24 @@ pub fn replay_in_memory(
                         hex_repr
                     }
                 };
+                let wg_endpoint = match derive_wg_endpoint(&endpoint) {
+                    Ok(addr) => Some(addr),
+                    Err(e) => {
+                        warn!(
+                            chain_id = event.chain_id,
+                            member = %decoded::hex0x(&member_id),
+                            public_endpoint = %endpoint,
+                            error = %e,
+                            "replay: publicEndpoint did not parse into a Phala-gateway uotcp target; wg_endpoint left None"
+                        );
+                        None
+                    }
+                };
 
                 let existed = members.contains_key(&member_id);
                 let row = members.entry(member_id).or_default();
                 row.public_endpoint = Some(endpoint);
+                row.wg_endpoint = wg_endpoint;
                 if !existed {
                     warn!(
                         chain_id = event.chain_id,
@@ -700,4 +735,139 @@ pub fn replay_in_memory(
     let members_json: Vec<serde_json::Value> =
         members.iter().map(|(id, row)| row.to_json(id)).collect();
     Ok(json!({ "members": members_json }))
+}
+
+/// Default uotcp port the fabric dialer connects to (spec
+/// docs/designs/network-architecture-unified.md §1.2).
+const WG_TRANSPORT_PORT: u16 = 51820;
+
+/// Phala dstack-gateway exposes published TCP ports as
+/// `<id>-<port>.<node>.phala.network:443`. The TLS-passthrough flavour
+/// suffixes the source port label with `s` (and `g` for grpc); both
+/// stripped here.
+const PHALA_GATEWAY_HTTPS_PORT: &str = "443";
+
+/// Convert a `PublicEndpointUpdated` URL into the explicit `host:port`
+/// uotcp target the spec calls `wg_endpoint` (§3.3, §9.3). Mirrors
+/// `crates/fabric/src/dialer_manager.rs::remote_tcp_addr_for(url, 51820)`
+/// — kept indexer-side so fabric is no longer responsible for parsing
+/// publicEndpoint at all.
+///
+/// Input shape: `https://<instance_id>-<port>[s|g].<node>.phala.network[:<https_port>][/...]`.
+/// Output: `<instance_id>-51820.<node>.phala.network:443`.
+fn derive_wg_endpoint(public_endpoint_url: &str) -> Result<String> {
+    let after_scheme = public_endpoint_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(public_endpoint_url);
+    // Strip path / query / fragment.
+    let host_and_port = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Drop any explicit `:port` — the gateway always answers on 443.
+    let host = host_and_port
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host_and_port);
+    if host.is_empty() {
+        anyhow::bail!("publicEndpoint has no host: {public_endpoint_url}");
+    }
+
+    let (label, suffix) = host
+        .split_once('.')
+        .ok_or_else(|| anyhow!("publicEndpoint host has no `.`: {host}"))?;
+
+    let (id, port_label) = label
+        .rsplit_once('-')
+        .ok_or_else(|| anyhow!("publicEndpoint label has no port suffix: {label}"))?;
+    if id.is_empty() {
+        anyhow::bail!("publicEndpoint label is missing instance_id: {label}");
+    }
+    if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("publicEndpoint instance label is not hex: {id} (full label: {label})");
+    }
+    let port_digits = port_label.trim_end_matches(['s', 'g']);
+    if port_digits.is_empty() || !port_digits.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("publicEndpoint port label is not numeric: {port_label}");
+    }
+
+    Ok(format!(
+        "{id}-{WG_TRANSPORT_PORT}.{suffix}:{PHALA_GATEWAY_HTTPS_PORT}"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_wg_endpoint_rewrites_port_label_to_51820() {
+        let url =
+            "https://abcdef0123456789abcdef0123456789abcdef01-5432.dstack-base-prod5.phala.network";
+        assert_eq!(
+            derive_wg_endpoint(url).unwrap(),
+            "abcdef0123456789abcdef0123456789abcdef01-51820.dstack-base-prod5.phala.network:443"
+        );
+    }
+
+    #[test]
+    fn derive_wg_endpoint_strips_passthrough_suffix() {
+        let url = "https://abcdef0123456789abcdef0123456789abcdef01-5432s.dstack-base-prod5.phala.network";
+        assert_eq!(
+            derive_wg_endpoint(url).unwrap(),
+            "abcdef0123456789abcdef0123456789abcdef01-51820.dstack-base-prod5.phala.network:443"
+        );
+    }
+
+    #[test]
+    fn derive_wg_endpoint_strips_grpc_suffix() {
+        let url = "https://abcdef0123456789abcdef0123456789abcdef01-8080g.dstack-base-prod4.phala.network";
+        assert_eq!(
+            derive_wg_endpoint(url).unwrap(),
+            "abcdef0123456789abcdef0123456789abcdef01-51820.dstack-base-prod4.phala.network:443"
+        );
+    }
+
+    #[test]
+    fn derive_wg_endpoint_ignores_path_and_query() {
+        let url = "https://abcdef0123456789abcdef0123456789abcdef01-8080.dstack-base-prod5.phala.network/health?foo=bar";
+        assert_eq!(
+            derive_wg_endpoint(url).unwrap(),
+            "abcdef0123456789abcdef0123456789abcdef01-51820.dstack-base-prod5.phala.network:443"
+        );
+    }
+
+    #[test]
+    fn derive_wg_endpoint_ignores_explicit_https_port() {
+        let url = "https://abcdef0123456789abcdef0123456789abcdef01-8080.dstack-base-prod5.phala.network:443/x";
+        assert_eq!(
+            derive_wg_endpoint(url).unwrap(),
+            "abcdef0123456789abcdef0123456789abcdef01-51820.dstack-base-prod5.phala.network:443"
+        );
+    }
+
+    #[test]
+    fn derive_wg_endpoint_rejects_label_without_port_suffix() {
+        let url = "https://abcdef0123.dstack-base-prod5.phala.network";
+        assert!(derive_wg_endpoint(url).is_err());
+    }
+
+    #[test]
+    fn derive_wg_endpoint_rejects_non_hex_instance_id() {
+        let url = "https://hello-world-8080.dstack-base-prod5.phala.network";
+        assert!(derive_wg_endpoint(url).is_err());
+    }
+
+    #[test]
+    fn derive_wg_endpoint_rejects_non_numeric_port_label() {
+        let url = "https://abcdef-portfoo.dstack-base-prod5.phala.network";
+        assert!(derive_wg_endpoint(url).is_err());
+    }
+
+    #[test]
+    fn derive_wg_endpoint_rejects_garbage() {
+        assert!(derive_wg_endpoint("not a url at all").is_err());
+        assert!(derive_wg_endpoint("").is_err());
+    }
 }
