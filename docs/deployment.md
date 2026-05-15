@@ -110,13 +110,24 @@ encrypted env on every call (CLAUDE.md memory
 `reference_hub_upgrade_procedure`).
 
 1. Bump the version + publish (steps 1-2 above).
-2. Find the existing CVM:
+2. **Re-apply `deploy/provision.sql` against the monitor cluster's
+   primary** before deploying the new image. The script's `ADD COLUMN
+   IF NOT EXISTS` statements are idempotent and back-fill any new
+   columns onto the existing roster without dropping data. The
+   indexer's startup preflight check (`schema_preflight.rs` —
+   `REQUIRED_COLUMNS` registry) refuses to start when columns added
+   in newer materializer code are missing from the database, so
+   skipping this step turns into an at-boot "migration required"
+   error after the deploy lands. Diff `REQUIRED_COLUMNS` against the
+   previously-deployed tag to see exactly which columns are new in
+   this build.
+3. Find the existing CVM:
 
    ```bash
    phala cvms list -j | jq '.items[] | select(.cvmName=="teesql-chain-indexer-prod") | {cvmName, vmUuid, appId}'
    ```
 
-3. Generate the deploy bundle in `--cvm-id` mode:
+4. Generate the deploy bundle in `--cvm-id` mode:
 
    ```bash
    set -a; source ~/.teesql/chain-indexer.env; set +a
@@ -130,13 +141,13 @@ encrypted env on every call (CLAUDE.md memory
    can extract the hash via `phala cvms provision --dry-run` and
    hand it to the Safe TX builder.
 
-4. Apply the upgrade:
+5. Apply the upgrade:
 
    ```bash
    cd deploy/out && ./phala-deploy-cmd.sh
    ```
 
-5. Verify (same checks as step 5 above). Cold-start backfill takes
+6. Verify (same checks as step 5 above). Cold-start backfill takes
    a few minutes; `as_of.block_number` should advance from the last
    pre-upgrade `chain_state.head_block` cursor in the database.
 

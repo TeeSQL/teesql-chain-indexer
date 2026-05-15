@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod quote_recovery;
 pub mod r2_mirror;
 pub mod reorg;
+pub mod schema_preflight;
 pub mod store;
 pub mod views;
 
@@ -31,6 +32,7 @@ pub use quote_recovery::{
 };
 pub use r2_mirror::{r2_key_for_quote, DisabledR2Mirror, R2QuoteMirror};
 pub use reorg::{ReorgError, ReorgHandler};
+pub use schema_preflight::verify_required_schema;
 pub use store::{
     as_addr, as_hash, ControlHoleRow, ControlInstructionRow, EventStore, MemberQuoteRow,
     WatchedContract,

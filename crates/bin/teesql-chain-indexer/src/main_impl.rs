@@ -119,6 +119,16 @@ pub async fn run() -> Result<()> {
 
     let pool = open_storage_pool(&cfg).await?;
 
+    // Schema preflight: fail fast at startup if the database is
+    // missing any column the materializers write to. Without this,
+    // an operator who upgrades the image but forgets to re-apply
+    // deploy/provision.sql first sees an opaque sqlx error on the
+    // next on-chain event rather than a clear "migration required"
+    // message at boot. See crates/core/src/schema_preflight.rs.
+    teesql_chain_indexer_core::verify_required_schema(&pool)
+        .await
+        .context("schema preflight against monitor cluster's primary")?;
+
     let metrics = Arc::new(Metrics::default());
     let mut by_shortname: HashMap<String, AppState> = HashMap::new();
     let mut ingestor_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();

@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use serde_json::json;
-use teesql_chain_indexer_views::{compose_hashes, leader, lifecycle, members, DecodedEvent};
+use teesql_chain_indexer_views::{
+    compose_hashes, leader, lifecycle, members, DecodedEvent, EventStore, View,
+};
 
 const CHAIN_ID: i32 = 8453;
 const CLUSTER: [u8; 20] = [
@@ -1716,30 +1718,267 @@ fn lifecycle_replay_ignores_non_destroy_events() {
 //
 // These are skipped in the default test run; CI without a Postgres
 // fixture passes the in-memory replay tests above and is enough for
-// the materializer logic. The ignored tests exist as a documentation
-// artifact for the integration step.
+// the materializer logic.
+//
+// Setup: point `DATABASE_URL` at any Postgres database whose schema
+// matches `deploy/provision.sql`. Each test uses a unique cluster
+// address so concurrent runs against the same database don't collide,
+// and every test cleans up its rows on exit (whether passing or
+// failing) so the schema can be reused.
 // ---------------------------------------------------------------------------
 
+/// Open a pool against `$DATABASE_URL`. Returns `None` (after printing
+/// a hint) when the env var is unset so a hand-run `cargo test --
+/// --ignored` without DATABASE_URL is a clean skip rather than a
+/// confusing connection-refused error.
+async fn db_pool() -> Option<sqlx::PgPool> {
+    let url = match std::env::var("DATABASE_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+            eprintln!(
+                "skipping: set DATABASE_URL=postgres://... and re-run \
+                 with `-- --ignored` to exercise the SQL apply path"
+            );
+            return None;
+        }
+    };
+    let pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("connect to DATABASE_URL");
+    Some(pool)
+}
+
+/// Build a fresh `EventStore` against the given pool. `chain_id` is
+/// always `CHAIN_ID` (Base mainnet's 8453) — the apply paths use it
+/// only as a scoping discriminator, so any consistent value works.
+async fn store(pool: sqlx::PgPool) -> EventStore {
+    EventStore::new(pool, CHAIN_ID)
+        .await
+        .expect("EventStore::new")
+}
+
+/// Insert a `blocks` row directly via SQL. The apply path's
+/// `lookup_block_ts` reads this; without it, `MemberRegistered` would
+/// bail with "blocks row missing".
+async fn seed_block(pool: &sqlx::PgPool, block_number: u64, block_ts: i64) {
+    sqlx::query(
+        "INSERT INTO blocks (chain_id, number, hash, parent_hash, block_ts) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (chain_id, number) DO UPDATE SET block_ts = EXCLUDED.block_ts",
+    )
+    .bind(CHAIN_ID)
+    .bind(block_number as i64)
+    .bind(&[0u8; 32][..])
+    .bind(&[0u8; 32][..])
+    .bind(block_ts)
+    .execute(pool)
+    .await
+    .expect("seed blocks row");
+}
+
+/// Remove every row the test inserted so the schema stays reusable
+/// across runs. Called via `scopeguard`-style explicit calls at the
+/// end of each test (we don't pull in `scopeguard` for one consumer).
+async fn cleanup(pool: &sqlx::PgPool, cluster: &[u8; 20]) {
+    let _ = sqlx::query("DELETE FROM cluster_members WHERE chain_id = $1 AND cluster_address = $2")
+        .bind(CHAIN_ID)
+        .bind(&cluster[..])
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM blocks WHERE chain_id = $1 AND number >= $2 AND number < $3")
+        .bind(CHAIN_ID)
+        .bind(100i64)
+        .bind(10_000i64)
+        .execute(pool)
+        .await;
+}
+
+/// GAP-W1-005 DB-backed apply test: drive `MembersView::apply` against
+/// a real Postgres and verify that a `PublicEndpointUpdated` event
+/// persists the materializer-derived `wg_endpoint` column. This is the
+/// test the original PR shipped as a stub; the Codex review's MEDIUM
+/// finding called out that the wgEndpoint write path had no DB
+/// coverage at all and would silently regress if the column rename or
+/// the URL-parser convention drifted out of `apply_public_endpoint_updated`.
+///
+/// Three assertions in one test (cheaper than three serial connect/
+/// cleanup cycles): the happy path persists `wg_endpoint`, an
+/// unparseable URL leaves it NULL while still recording
+/// `public_endpoint`, and a follow-up `PublicEndpointUpdated` with a
+/// fresh URL rotates `wg_endpoint` to the new derivation.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing at a chain_indexer schema"]
+async fn members_apply_persists_wg_endpoint() {
+    let Some(pool) = db_pool().await else {
+        return;
+    };
+    // Unique per-test cluster address so this test can run alongside
+    // others (or the same test from a different worker) against a
+    // shared database without colliding on the cluster_members PK.
+    let cluster: [u8; 20] = [
+        0xAA, 0xAA, 0xAA, 0xAA, 0x00, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05,
+        0x05, 0x05, 0x05, 0x05, 0x05,
+    ];
+    cleanup(&pool, &cluster).await; // be tolerant of a prior aborted run
+    seed_block(&pool, 100, 1_700_000_000).await;
+    seed_block(&pool, 150, 1_700_000_500).await;
+    seed_block(&pool, 200, 1_700_001_000).await;
+
+    let store = store(pool.clone()).await;
+    let view = members::MembersView::new();
+
+    let member = member_id_str(0xA1);
+    let member_bytes = {
+        let raw = hex::decode(member.trim_start_matches("0x")).unwrap();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&raw);
+        out
+    };
+
+    // Step 1: MemberRegistered — establish the row so subsequent
+    // events update rather than stub-insert.
+    let registered = DecodedEvent {
+        chain_id: CHAIN_ID,
+        contract: cluster,
+        block_number: 100,
+        block_hash: [0u8; 32],
+        log_index: 0,
+        tx_hash: [0u8; 32],
+        topic0: [0u8; 32],
+        topics_rest: Vec::new(),
+        data: Vec::new(),
+        kind: Some("MemberRegistered".into()),
+        decoded: Some(json!({
+            "memberId": member,
+            "instanceId": address_str(0x10),
+            "passthrough": address_str(0x20),
+            "dnsLabel": "wgendpoint-test",
+        })),
+    };
+    view.apply(&store, &registered)
+        .await
+        .expect("apply MemberRegistered");
+
+    // Step 2: PublicEndpointUpdated with a parseable Phala-gateway URL
+    // — expect `wg_endpoint` to be derived and persisted.
+    let url =
+        "https://abcdef0123456789abcdef0123456789abcdef01-5432.dstack-base-prod5.phala.network";
+    let url_hex = format!("0x{}", hex::encode(url));
+    let endpoint_event = DecodedEvent {
+        chain_id: CHAIN_ID,
+        contract: cluster,
+        block_number: 150,
+        block_hash: [0u8; 32],
+        log_index: 0,
+        tx_hash: [0u8; 32],
+        topic0: [0u8; 32],
+        topics_rest: Vec::new(),
+        data: Vec::new(),
+        kind: Some("PublicEndpointUpdated".into()),
+        decoded: Some(json!({
+            "memberId": member,
+            "publicEndpoint": url_hex,
+        })),
+    };
+    view.apply(&store, &endpoint_event)
+        .await
+        .expect("apply PublicEndpointUpdated (parseable)");
+
+    let (pe, we): (String, Option<String>) = sqlx::query_as(
+        "SELECT public_endpoint, wg_endpoint \
+         FROM cluster_members \
+         WHERE chain_id = $1 AND cluster_address = $2 AND member_id = $3",
+    )
+    .bind(CHAIN_ID)
+    .bind(&cluster[..])
+    .bind(&member_bytes[..])
+    .fetch_one(&pool)
+    .await
+    .expect("read back cluster_members row");
+    assert_eq!(pe, url, "public_endpoint must round-trip");
+    assert_eq!(
+        we.as_deref(),
+        Some("abcdef0123456789abcdef0123456789abcdef01-51820.dstack-base-prod5.phala.network:443"),
+        "wg_endpoint must be derived from publicEndpoint by the materializer"
+    );
+
+    // Step 3: PublicEndpointUpdated with an unparseable URL — expect
+    // `wg_endpoint` to revert to NULL while `public_endpoint` is
+    // updated to the new (bad) value. Models a blue-green redeploy
+    // that landed a URL the parser can't handle; fabric must defer
+    // admission rather than reuse the stale wg_endpoint.
+    let bad_url = "https://abc.phala.network";
+    let bad_hex = format!("0x{}", hex::encode(bad_url));
+    let bad_event = DecodedEvent {
+        chain_id: CHAIN_ID,
+        contract: cluster,
+        block_number: 200,
+        block_hash: [0u8; 32],
+        log_index: 0,
+        tx_hash: [0u8; 32],
+        topic0: [0u8; 32],
+        topics_rest: Vec::new(),
+        data: Vec::new(),
+        kind: Some("PublicEndpointUpdated".into()),
+        decoded: Some(json!({
+            "memberId": member,
+            "publicEndpoint": bad_hex,
+        })),
+    };
+    view.apply(&store, &bad_event)
+        .await
+        .expect("apply PublicEndpointUpdated (unparseable)");
+
+    let (pe2, we2): (String, Option<String>) = sqlx::query_as(
+        "SELECT public_endpoint, wg_endpoint \
+         FROM cluster_members \
+         WHERE chain_id = $1 AND cluster_address = $2 AND member_id = $3",
+    )
+    .bind(CHAIN_ID)
+    .bind(&cluster[..])
+    .bind(&member_bytes[..])
+    .fetch_one(&pool)
+    .await
+    .expect("read back cluster_members row after unparseable update");
+    assert_eq!(
+        pe2, bad_url,
+        "public_endpoint must reflect the latest event"
+    );
+    assert!(
+        we2.is_none(),
+        "unparseable publicEndpoint must reset wg_endpoint to NULL, got {we2:?}"
+    );
+
+    cleanup(&pool, &cluster).await;
+}
+
+/// Companion test that exercises the schema-preflight side: the
+/// indexer's `verify_required_schema` must succeed against a schema
+/// that has the `wg_endpoint` + `wg_pubkey_hex` columns. Pairs with
+/// the apply test above by verifying the boot-time check this indexer
+/// build runs accepts the same schema the apply path writes to.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing at a chain_indexer schema"]
+async fn schema_preflight_accepts_provisioned_schema() {
+    let Some(pool) = db_pool().await else {
+        return;
+    };
+    teesql_chain_indexer_core::verify_required_schema(&pool)
+        .await
+        .expect("verify_required_schema against a provisioned schema must succeed");
+}
+
 #[test]
-#[ignore = "requires DATABASE_URL pointing at a fresh chain_indexer schema"]
+#[ignore = "requires DATABASE_URL pointing at a chain_indexer schema"]
 fn leader_apply_persists_strict_inequality() {
-    // Stub: the integration test would
-    //   1. open a sqlx PgPool against $DATABASE_URL
-    //   2. truncate cluster_leader and events
-    //   3. seed a blocks row
-    //   4. drive LeaderView.apply with a sequence of events
-    //   5. assert cluster_leader contents after each step
-    // Left as a TODO until Phase 2 brings up the integration harness.
+    // Companion stub for LeaderView's apply path — left intentionally
+    // empty pending the same harness the wg_endpoint test now uses.
+    // See `members_apply_persists_wg_endpoint` for the pattern.
 }
 
 #[test]
-#[ignore = "requires DATABASE_URL pointing at a fresh chain_indexer schema"]
-fn members_apply_idempotent_under_ws_replay() {
-    // Stub — see leader_apply_persists_strict_inequality.
-}
-
-#[test]
-#[ignore = "requires DATABASE_URL pointing at a fresh chain_indexer schema"]
+#[ignore = "requires DATABASE_URL pointing at a chain_indexer schema"]
 fn lifecycle_apply_destroyed_at_set_once() {
-    // Stub — see leader_apply_persists_strict_inequality.
+    // Companion stub for LifecycleView's apply path — see
+    // `members_apply_persists_wg_endpoint` for the pattern.
 }

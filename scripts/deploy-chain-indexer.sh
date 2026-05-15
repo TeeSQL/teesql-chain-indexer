@@ -302,10 +302,30 @@ if [[ -n "${CVM_ID}" ]]; then
     echo "    See docs/deployment.md for the exact Safe TX shape."
     echo
 fi
-echo "==> Prerequisite for first deploy: monitor cluster's primary must"
-echo "    have run deploy/provision.sql. Re-run after every primary"
-echo "    redeploy (pgdata is per-CVM — see CLAUDE.md memory"
-echo "    project_primary_pgdata_per_cvm)."
+echo "==> Schema prerequisite: monitor cluster's primary must have run"
+echo "    deploy/provision.sql. The indexer does NOT auto-migrate; it"
+echo "    runs a startup preflight check and bails with a clear"
+echo "    \"migration required\" error if any required column is missing."
+echo
+if [[ -n "${CVM_ID}" ]]; then
+    echo "    UPGRADE PATH (this run): re-apply deploy/provision.sql BEFORE"
+    echo "    running the new image. The script's ADD COLUMN IF NOT EXISTS"
+    echo "    statements are idempotent and back-fill new columns onto the"
+    echo "    existing roster without dropping data. Skip this and the"
+    echo "    indexer's schema preflight will refuse to start. The"
+    echo "    canonical column registry is REQUIRED_COLUMNS in"
+    echo "    crates/core/src/schema_preflight.rs — diff against the"
+    echo "    previously-deployed tag to see exactly what's new in this"
+    echo "    build."
+else
+    echo "    FIRST DEPLOY PATH (this run): run deploy/provision.sql once"
+    echo "    after the monitor cluster is up; the indexer's preflight"
+    echo "    treats a fresh schema as valid because every CREATE TABLE"
+    echo "    already includes the columns this build needs."
+fi
+echo
+echo "    Also re-apply after every primary redeploy because pgdata is"
+echo "    per-CVM — see CLAUDE.md memory project_primary_pgdata_per_cvm."
 echo
 echo "==> Next:"
 echo "    cd ${OUT_DIR} && ./phala-deploy-cmd.sh"
